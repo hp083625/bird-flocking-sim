@@ -144,6 +144,12 @@ namespace Bird_behiviour.Flocking.Simulation
 
         private bool arraysAllocated;
 
+        // Tracks the tail of the most recent Tick's job graph. DisposeArrays /
+        // OnDestroy drains it before deallocating the NativeArrays the jobs touched —
+        // without this, exiting Play mid-tick throws "JobHandle.Complete() before
+        // you can deallocate ... safely".
+        private JobHandle pendingTickHandle;
+
         // ── Camera frustum cache (Slice 8 / M4) ──────────────────────────────────────
         //
         // 6 planes encoded as float4 (xyz = inward-facing normal, w = signed distance);
@@ -340,6 +346,11 @@ namespace Bird_behiviour.Flocking.Simulation
             {
                 return;
             }
+            // Drain any in-flight Tick before deallocating arrays the jobs touched —
+            // necessary when Play exits mid-tick, on domain reload, or if Tick threw
+            // before reaching its own Complete() call.
+            pendingTickHandle.Complete();
+            pendingTickHandle = default;
             if (Positions.IsCreated)     Positions.Dispose();
             if (Velocities.IsCreated)    Velocities.Dispose();
             if (Accelerations.IsCreated) Accelerations.Dispose();
@@ -592,21 +603,33 @@ namespace Bird_behiviour.Flocking.Simulation
                 UpdateCameraFrustumPlanesFrom(cam);
             }
 
-            // Per-flock cull → matrices chain. Cull is independent of steering; the
-            // matrices job for flock f fans in on CombineDependencies(cullH[f], integrateH)
-            // because it reads the *integrated* positions/velocities and the cull's
-            // visible-index list (via IJobParallelForDefer.AsDeferredJobArray()).
-            JobHandle matricesAllH = ScheduleCullAndMatrices(integrateH, BirdCullRadius);
+            // Snapshot positions so FrustumCullJob can run in parallel with IntegrateJob
+            // without tripping the safety system (cull is [ReadOnly] on its position
+            // input; integrate is read-write on Positions). The snapshot reflects the
+            // *previous* Tick's integrated positions — i.e. cull lags by one frame.
+            // BirdCullRadius (~2× bird size) absorbs the up-to-MaxSpeed*dt position
+            // delta since the snapshot, so the lag is invisible to the player.
+            //
+            // Main-thread NativeArray copy ctor: ~100us for 50k birds (12 B / bird memcpy),
+            // dwarfed by the steering chain. TempJob lifetime: disposed below after the
+            // cull/matrices fan-in completes.
+            var cullPositions = new NativeArray<float3>(Positions, Allocator.TempJob);
 
-            // Single sync point: completes the steering chain AND every flock's cull +
-            // matrices jobs (matricesAllH already depends on integrateH transitively).
+            // Per-flock cull → matrices chain. Cull reads `cullPositions` (snapshot),
+            // matrices reads `Positions` (post-integrate) — so matrices for flock f
+            // fans in on CombineDependencies(cullH[f], integrateH).
+            JobHandle matricesAllH = ScheduleCullAndMatrices(integrateH, BirdCullRadius, cullPositions);
+            pendingTickHandle = matricesAllH; // tracked for safe Dispose if Play stops mid-tick
+
+            // Single sync point: drains steering chain AND every flock's cull + matrices.
             matricesAllH.Complete();
 
-            // Dispose per-frame TempJob buffers now that IntegrateJob has consumed them.
+            // Dispose per-frame TempJob buffers now that consumers have completed.
             accelNeighbor.Dispose();
             accelBounds.Dispose();
             accelCursor.Dispose();
             kernelSettings.Dispose();
+            cullPositions.Dispose();
 
             // ── 4. Dispatch per-flock rendering off the now-populated visible buffers.
             DispatchRendering(cam);
@@ -618,15 +641,17 @@ namespace Bird_behiviour.Flocking.Simulation
         /// completes alongside the steering chain.
         /// </summary>
         /// <remarks>
-        /// Cull jobs depend on <c>default</c> (no inputs from steering) and write into
-        /// per-flock <c>NativeList&lt;int&gt;</c>s sized to the flock's bird count. The
-        /// matrices job for flock <c>f</c> uses
+        /// Cull jobs read the supplied <paramref name="cullPositions"/> snapshot (so they
+        /// can run in parallel with IntegrateJob's writes to <see cref="Positions"/>) and
+        /// write into per-flock <c>NativeList&lt;int&gt;</c>s pre-sized to the flock's
+        /// bird count. The matrices job for flock <c>f</c> uses
         /// <c>visibleIndicesPerFlock[f].AsDeferredJobArray()</c> so its iteration count is
         /// resolved at job-start from the cull's output length — no main-thread sync
-        /// between the two. Read the per-flock visible counts off
-        /// <c>visibleIndicesPerFlock[f].Length</c> after the returned handle completes.
+        /// between cull and matrices. The matrices job reads the *post-integration*
+        /// <see cref="Positions"/> and <see cref="Velocities"/>, so it depends on
+        /// CombineDependencies(cullH, integrateH).
         /// </remarks>
-        private JobHandle ScheduleCullAndMatrices(JobHandle integrateH, float birdRadius)
+        private JobHandle ScheduleCullAndMatrices(JobHandle integrateH, float birdRadius, NativeArray<float3> cullPositions)
         {
             JobHandle combinedH = integrateH; // ensures the caller's single Complete() drains everything
             int batch = math.max(1, SteeringBatchSize);
@@ -644,7 +669,7 @@ namespace Bird_behiviour.Flocking.Simulation
                 {
                     cullH = new FrustumCullJob
                     {
-                        Positions             = Positions,
+                        Positions             = cullPositions,
                         CameraFrustumPlanes   = cameraFrustumPlanes,
                         StartIndex            = slice.StartIndex,
                         BirdRadius            = birdRadius,
