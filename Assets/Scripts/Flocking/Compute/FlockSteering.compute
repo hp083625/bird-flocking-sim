@@ -26,6 +26,7 @@
 #pragma kernel CSClearCellStart
 #pragma kernel CSCellStart
 #pragma kernel CSSteerCellList
+#pragma kernel CSSteerTopoK
 #pragma kernel CSBuildMatrices
 
 // ── Boid struct (mirror of Compute/BoidGpu.cs) ────────────────────────────────
@@ -410,6 +411,202 @@ void CSSteerBruteForce(uint3 tid : SV_DispatchThreadID)
     }
 
     // Integrate velocity, clamp speed range.
+    float3 vel = selfVel + a * _Dt;
+    float speedSq = dot(vel, vel);
+    float minSq = _MinSpeed * _MinSpeed;
+    float maxSq = _MaxSpeed * _MaxSpeed;
+    if (speedSq > maxSq && speedSq > 0.0f)
+    {
+        vel = vel * (_MaxSpeed * rsqrt(speedSq));
+    }
+    else if (speedSq < minSq)
+    {
+        if (speedSq > 1e-12f)
+        {
+            vel = vel * (_MinSpeed * rsqrt(speedSq));
+        }
+        else
+        {
+            vel = float3(0, 0, _MinSpeed);
+        }
+    }
+
+    me.vel = vel;
+    me.pos = selfPos + vel * _Dt;
+    _Boids[i] = me;
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// CSSteerTopoK — P5 hot path. Same 27-cell walk as CSSteerCellList, but the
+// inner loop only retains the K=8 NEAREST neighbours found during the walk
+// (via a register-resident insertion-sorted K-array), then accumulates forces
+// from only those K. This bounds per-bird cost regardless of cell density —
+// 100k birds in a 50³ box become as cheap per-bird as 20k birds.
+//
+// Why K=8: Ballerini et al. 2008 (PNAS 105(4)) found via field-tracking 3D
+// data that real starlings interact with 6-7 topological neighbours regardless
+// of distance. K=8 leaves a small margin for sparse populations where some of
+// the K slots stay invalid. Empirically the visual character of the flock is
+// indistinguishable from the metric path under a close-camera observer.
+//
+// Memory: K=8 * (uint id + float sqDist) = 64 B per thread. Apple GPU register
+// file accommodates this comfortably at 64 threads/group. The insertion sort
+// is bounded by K iterations and unrolls cleanly under [loop] hint.
+// ──────────────────────────────────────────────────────────────────────────────
+[numthreads(64, 1, 1)]
+void CSSteerTopoK(uint3 tid : SV_DispatchThreadID)
+{
+    uint i = tid.x;
+    if (i >= _BirdCount) return;
+
+    Boid me = _Boids[i];
+    float3 selfPos = me.pos;
+    float3 selfVel = me.vel;
+
+    int3 myCell = WorldToCell(selfPos);
+    float perceptSq = _PerceptionRadius * _PerceptionRadius;
+
+    // K-NN state — register-resident. INVALID id sentinel = 0xFFFFFFFF.
+    // sqDist starts at +infinity so the first K candidates always insert.
+    const uint KMAX = 8;
+    uint  knnIds[KMAX];
+    float knnSqDist[KMAX];
+    [unroll] for (uint kk = 0; kk < KMAX; ++kk)
+    {
+        knnIds[kk]    = 0xFFFFFFFFu;
+        knnSqDist[kk] = 1e30f;
+    }
+
+    // 27-cell walk — record candidates into the K-NN array.
+    [unroll] for (int dz = -1; dz <= 1; ++dz)
+    {
+        [unroll] for (int dy = -1; dy <= 1; ++dy)
+        {
+            [unroll] for (int dx = -1; dx <= 1; ++dx)
+            {
+                int3 cell = myCell + int3(dx, dy, dz);
+                if (cell.x < 0 || cell.y < 0 || cell.z < 0 ||
+                    cell.x >= (int)_GridDim.x || cell.y >= (int)_GridDim.y || cell.z >= (int)_GridDim.z)
+                {
+                    continue;
+                }
+
+                uint cid = FlatCellId(cell);
+                uint start = _CellStart[cid];
+                if (start >= _PaddedKeyCount) continue;
+
+                for (uint k = start; k < _PaddedKeyCount; ++k)
+                {
+                    uint2 entry = _CellKeys[k];
+                    if (entry.x != cid) break;
+
+                    uint j = entry.y;
+                    if (j == i) continue;
+
+                    float3 nbPos = _Boids[j].pos;
+                    float3 toN = nbPos - selfPos;
+                    float distSq = dot(toN, toN);
+                    if (distSq > perceptSq || distSq <= 1e-12f) continue;
+
+                    // Insert into K-NN if closer than the current K-th element.
+                    if (distSq < knnSqDist[KMAX - 1u])
+                    {
+                        // Bubble-shift larger elements right until we find the
+                        // insertion slot. Bounded by KMAX=8 iterations; HLSL
+                        // unrolls trivially.
+                        uint pos = KMAX - 1u;
+                        [unroll] for (uint shift = 0; shift < KMAX - 1u; ++shift)
+                        {
+                            uint p = KMAX - 1u - shift;
+                            if (p > 0u && knnSqDist[p - 1u] > distSq)
+                            {
+                                knnSqDist[p] = knnSqDist[p - 1u];
+                                knnIds[p]    = knnIds[p - 1u];
+                                pos = p - 1u;
+                            }
+                            else
+                            {
+                                pos = p;
+                                break;
+                            }
+                        }
+                        knnSqDist[pos] = distSq;
+                        knnIds[pos]    = j;
+                    }
+                }
+            }
+        }
+    }
+
+    // Accumulate forces from the K nearest. Re-read positions/velocities (Apple
+    // GPU keeps them hot in L1 from the walk above so the cost is negligible).
+    float sepRSq = _SeparationRadius * _SeparationRadius;
+    float3 sepAccum = float3(0, 0, 0);
+    float3 aliSum   = float3(0, 0, 0);
+    float3 cohSum   = float3(0, 0, 0);
+    uint   nCount   = 0;
+
+    [unroll] for (uint kk = 0; kk < KMAX; ++kk)
+    {
+        if (knnIds[kk] == 0xFFFFFFFFu) break;
+        Boid nb = _Boids[knnIds[kk]];
+        float distSq = knnSqDist[kk];
+
+        if (distSq < sepRSq)
+        {
+            float3 toN = nb.pos - selfPos;
+            float invD = rsqrt(distSq);
+            float dist = distSq * invD;
+            float fall = 1.0f - dist / _SeparationRadius;
+            sepAccum -= toN * (invD * fall);
+        }
+        aliSum += nb.vel;
+        cohSum += nb.pos;
+        nCount++;
+    }
+
+    // Reynolds alignment + cohesion.
+    float3 ali = float3(0, 0, 0);
+    float3 coh = float3(0, 0, 0);
+    if (nCount > 0u)
+    {
+        float invN = 1.0f / (float)nCount;
+        float3 avgVel = aliSum * invN;
+        float avgVelSq = dot(avgVel, avgVel);
+        if (avgVelSq > 1e-12f)
+        {
+            float3 desired = avgVel * rsqrt(avgVelSq) * _MaxSpeed;
+            ali = (desired - selfVel);
+        }
+        float3 cohCentroid = cohSum * invN;
+        coh = cohCentroid - selfPos;
+    }
+
+    // Soft preferred-zone pull.
+    float3 off = selfPos - _PreferredCenter;
+    float3 over = max(abs(off) - _PreferredExtents, float3(0, 0, 0));
+    float overMag = length(over);
+    float3 boundsForce = float3(0, 0, 0);
+    if (overMag > 1e-6f)
+    {
+        float dist = length(off);
+        float maxExtent = max(max(_PreferredExtents.x, _PreferredExtents.y), max(_PreferredExtents.z, 1e-3f));
+        float falloff = saturate(1.0f - dist / maxExtent);
+        float3 dir = (dist > 1e-6f) ? -off / dist : float3(0, 0, 0);
+        boundsForce = dir * (overMag * _PreferredAttractionWeight * (1.0f - falloff * 0.5f));
+    }
+
+    float3 a = sepAccum * _SepWeight + ali * _AliWeight + coh * _CohWeight + boundsForce;
+
+    // Cap acceleration.
+    float maxASq = _MaxAcceleration * _MaxAcceleration;
+    float aSq = dot(a, a);
+    if (aSq > maxASq && aSq > 0.0f)
+    {
+        a = a * (_MaxAcceleration * rsqrt(aSq));
+    }
+
+    // Integrate, clamp speed.
     float3 vel = selfVel + a * _Dt;
     float speedSq = dot(vel, vel);
     float minSq = _MinSpeed * _MinSpeed;

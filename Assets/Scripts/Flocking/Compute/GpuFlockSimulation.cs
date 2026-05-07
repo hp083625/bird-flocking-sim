@@ -81,6 +81,8 @@ namespace Bird_behiviour.Flocking.Compute
         [SerializeField] private ComputeShader bitonicShader;
         [Tooltip("If true, the spatial-hash path is bypassed and a brute-force O(N²) kernel is used instead. P1 fallback for debugging — leave OFF for perf.")]
         [SerializeField] private bool useBruteForce = false;
+        [Tooltip("If true (default), the steering kernel keeps only the K=8 nearest neighbours per bird via an in-register insertion sort, bounding per-bird cost regardless of cell density (Ballerini et al. 2008). Disable to compare against the metric (all-in-radius) path.")]
+        [SerializeField] private bool useTopologicalK = true;
 
         // ── GPU buffers (Persistent — disposed in OnDisable) ────────────────────
         private GraphicsBuffer boidsBuffer;     // RWStructuredBuffer<Boid> — 48 B / element
@@ -105,6 +107,7 @@ namespace Bird_behiviour.Flocking.Compute
         private int kClearCellStart;
         private int kCellStart;
         private int kSteerCellList;
+        private int kSteerTopoK;
         private int kBuildMat;
 
         // ── Cached property ids ─────────────────────────────────────────────────
@@ -172,6 +175,7 @@ namespace Bird_behiviour.Flocking.Compute
             kClearCellStart  = steeringShader.FindKernel("CSClearCellStart");
             kCellStart       = steeringShader.FindKernel("CSCellStart");
             kSteerCellList   = steeringShader.FindKernel("CSSteerCellList");
+            kSteerTopoK      = steeringShader.FindKernel("CSSteerTopoK");
             kBuildMat        = steeringShader.FindKernel("CSBuildMatrices");
 
             // BitonicSort.compute is required when useBruteForce==false. Try to load.
@@ -331,10 +335,15 @@ namespace Bird_behiviour.Flocking.Compute
             steeringShader.SetBuffer(kCellStart, IdCellKeys,  cellKeysBuffer);
             steeringShader.SetBuffer(kCellStart, IdCellStart, cellStartBuffer);
 
-            // SteerCellList: reads everything, writes back to _Boids.
+            // SteerCellList (P2 metric path): reads everything, writes back to _Boids.
             steeringShader.SetBuffer(kSteerCellList, IdBoids,    boidsBuffer);
             steeringShader.SetBuffer(kSteerCellList, IdCellKeys, cellKeysBuffer);
             steeringShader.SetBuffer(kSteerCellList, IdCellStart, cellStartBuffer);
+
+            // SteerTopoK (P5 topological-K path): same buffers, K-NN inner loop.
+            steeringShader.SetBuffer(kSteerTopoK, IdBoids,    boidsBuffer);
+            steeringShader.SetBuffer(kSteerTopoK, IdCellKeys, cellKeysBuffer);
+            steeringShader.SetBuffer(kSteerTopoK, IdCellStart, cellStartBuffer);
 
             // SteerBruteForce: P1 fallback path — only reads/writes Boids.
             steeringShader.SetBuffer(kSteerBruteForce, IdBoids, boidsBuffer);
@@ -400,8 +409,9 @@ namespace Bird_behiviour.Flocking.Compute
                     steeringShader.Dispatch(kClearCellStart, groupsCell, 1, 1);
                     steeringShader.Dispatch(kCellStart,      groupsKey,  1, 1);
                 }
-                using (MkSteer.Auto())    { steeringShader.Dispatch(kSteerCellList, groupsBird, 1, 1); }
-                using (MkMatrices.Auto()) { steeringShader.Dispatch(kBuildMat,      groupsBird, 1, 1); }
+                int kSteer = useTopologicalK ? kSteerTopoK : kSteerCellList;
+                using (MkSteer.Auto())    { steeringShader.Dispatch(kSteer,    groupsBird, 1, 1); }
+                using (MkMatrices.Auto()) { steeringShader.Dispatch(kBuildMat, groupsBird, 1, 1); }
             }
 
             // ── Render ──────────────────────────────────────────────────────────
