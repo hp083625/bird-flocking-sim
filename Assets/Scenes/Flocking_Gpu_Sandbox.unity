@@ -632,6 +632,12 @@ MonoBehaviour:
     preferredCenter: {x: -30, y: 0, z: 0}
     preferredExtents: {x: 15, y: 10, z: 25}
     preferredAttractionWeight: 1
+    killable: 1
+    isPredator: 0
+    killRadius: 0
+    respawnDelaySeconds: 5
+    deathDurationSeconds: 1.5
+    satedDurationSeconds: 0
   - name: Prey_Recommended
     birdCount: 9000
     color: {r: 0.3, g: 1, b: 0.4, a: 1}
@@ -652,6 +658,12 @@ MonoBehaviour:
     preferredCenter: {x: 30, y: 0, z: 0}
     preferredExtents: {x: 15, y: 10, z: 25}
     preferredAttractionWeight: 1
+    killable: 1
+    isPredator: 0
+    killRadius: 0
+    respawnDelaySeconds: 5
+    deathDurationSeconds: 1.5
+    satedDurationSeconds: 0
   - name: Predator
     birdCount: 2000
     color: {r: 0.95, g: 0.1, b: 0.1, a: 1}
@@ -672,6 +684,12 @@ MonoBehaviour:
     preferredCenter: {x: 0, y: 5, z: 0}
     preferredExtents: {x: 40, y: 10, z: 25}
     preferredAttractionWeight: 1
+    killable: 0
+    isPredator: 1
+    killRadius: 1.5
+    respawnDelaySeconds: 0
+    deathDurationSeconds: 0
+    satedDurationSeconds: 2
   birdCount: 20000
   randomSeed: 42
   worldBoundsCenter: {x: 0, y: 0, z: 0}

@@ -63,11 +63,26 @@ namespace Bird_behiviour.Flocking.Compute
         public float  PreferredAttractionWeight;
         public float3 PreferredExtents;
 
-        // Stride = 96 bytes. 24 floats × 4 bytes. Each 16-byte line of an Apple GPU
-        // read pulls 4 floats so this lays out as 6 contiguous lines per entry. Do
-        // NOT add fields without bumping the matching FlockKernelSettings struct in
-        // FlockSteering.compute and updating the stride below — GraphicsBuffer.SetData
-        // requires sizeof(T) == buffer stride exactly.
-        public const int Stride = 96;
+        // ── K-series kill-mechanic fields (K0 foundation) ───────────────────────
+        /// <summary>1.0 = this flock's birds can be killed by predators; 0.0 = invulnerable.</summary>
+        public float Killable;
+        /// <summary>1.0 = this flock kills out-of-flock birds inside its <see cref="KillRadius"/>; 0.0 = harmless.</summary>
+        public float IsPredator;
+        /// <summary>Radius (world units) within which a predator triggers a kill on a killable bird.</summary>
+        public float KillRadius;
+        /// <summary>Seconds before a killed bird respawns. 0 = vanish forever.</summary>
+        public float RespawnDelaySeconds;
+
+        /// <summary>Seconds the death animation (tilt + fall) plays before the bird despawns or respawns.</summary>
+        public float DeathDurationSeconds;
+        /// <summary>Seconds after a kill that a predator's chase force is suppressed (K4).</summary>
+        public float SatedDurationSeconds;
+        public float Pad0; // align to 16-byte
+        public float Pad1;
+
+        // Stride = 128 bytes. 32 floats × 4 bytes = 8 contiguous 16-byte lines.
+        // Updated from 96 in K0 to add killable/predator/kill-radius/respawn/death/sated.
+        // GraphicsBuffer.SetData requires sizeof(T) == buffer stride exactly.
+        public const int Stride = 128;
     }
 }
