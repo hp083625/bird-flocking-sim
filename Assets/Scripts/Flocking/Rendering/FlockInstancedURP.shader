@@ -126,6 +126,12 @@ Shader "Bird_behiviour/FlockInstancedURP"
             #include "Packages/com.unity.render-pipelines.universal/ShaderLibrary/Core.hlsl"
             #include "Packages/com.unity.render-pipelines.universal/ShaderLibrary/Shadows.hlsl"
 
+            // URP's ShadowCasterPass.hlsl declares these as cbuffer globals at file
+            // scope. We don't include the pass file (we have our own SV_InstanceID
+            // vertex), so re-declare both here to satisfy the linker.
+            float3 _LightDirection;
+            float3 _LightPosition;
+
             StructuredBuffer<float4x4> _Matrices;
 
             struct Attributes
