@@ -343,6 +343,90 @@ namespace Bird_behiviour.Flocking.Compute
             }
         }
 
+        /// <summary>
+        /// Live-tuning hot path. Mirrors <see cref="ResolveFlockConfigs"/> but only
+        /// refreshes the *non-structural* fields (color, weights, radii, speeds,
+        /// cursor params, preferred zone) — leaves <c>resolvedTotalBirdCount</c>,
+        /// the buffer sizes, and the spawned bird positions alone. Structural
+        /// changes (birdCount per flock, flock count) still require a Restart Sim.
+        /// </summary>
+        private void ResolveFlockSettingsLive()
+        {
+            if (resolvedFlocks == null || resolvedFlocks.Length == 0) return;
+
+            if (flocks != null && flocks.Length > 0)
+            {
+                int n = math.min(resolvedFlocks.Length, flocks.Length);
+                for (int f = 0; f < n; f++)
+                {
+                    // Preserve the originally-spawned birdCount so structural changes
+                    // don't take effect mid-run; everything else is live.
+                    int spawnedCount = resolvedFlocks[f].birdCount;
+                    var src = flocks[f];
+                    src.birdCount = spawnedCount;
+                    resolvedFlocks[f] = src;
+                }
+            }
+            else
+            {
+                // Legacy single-flock fallback path — refresh the synthesised entry's
+                // tunables from the inspector fields each frame.
+                int spawnedCount = resolvedFlocks[0].birdCount;
+                resolvedFlocks[0] = new FlockGpuConfig
+                {
+                    name                            = resolvedFlocks[0].name,
+                    birdCount                       = spawnedCount,
+                    color                           = defaultFlockColor,
+                    perceptionRadius                = perceptionRadius,
+                    separationRadius                = separationRadius,
+                    perceptionConeHalfAngleRadians  = perceptionConeHalfAngleRadians,
+                    minSpeed                        = minSpeed,
+                    maxSpeed                        = maxSpeed,
+                    maxAcceleration                 = maxAcceleration,
+                    inSeparationWeight              = separationWeight,
+                    inAlignmentWeight               = alignmentWeight,
+                    inCohesionWeight                = cohesionWeight,
+                    outSeparationWeight             = separationWeight,
+                    outAlignmentWeight              = 0f,
+                    outCohesionWeight               = 0f,
+                    cursorReactionStrength          = cursorReactionStrength,
+                    cursorReactionRadius            = cursorReactionRadius,
+                    preferredCenter                 = preferredCenter,
+                    preferredExtents                = preferredExtents,
+                    preferredAttractionWeight       = preferredAttractionWeight,
+                };
+            }
+
+            // Refresh the palette so per-flock color tweaks land each frame.
+            for (int f = 0; f < flockColorPalette.Length; f++)
+            {
+                int src = math.min(f, resolvedFlocks.Length - 1);
+                Color c = resolvedFlocks[src].color;
+                if (c.a <= 0f) c.a = 1f;
+                flockColorPalette[f] = new Vector4(c.r, c.g, c.b, c.a);
+            }
+            // Re-bind palette to the renderer's cloned material so live color
+            // changes take effect without a Restart.
+            if (renderer != null && birdMaterial != null && instanceFlockIdsBuffer != null)
+            {
+                renderer.BindShaderFlockData(birdMaterial, instanceFlockIdsBuffer, flockColorPalette);
+            }
+        }
+
+        /// <summary>
+        /// Tears the GPU pipeline down + re-runs OnEnable. Triggered by the
+        /// "Restart Sim" context-menu item on the GpuFlockSimulation component.
+        /// Use this after a structural inspector change (birdCount per flock,
+        /// adding/removing a flock entry).
+        /// </summary>
+        [ContextMenu("Restart Sim")]
+        public void RestartSim()
+        {
+            if (!isActiveAndEnabled) return;
+            OnDisable();
+            OnEnable();
+        }
+
         // Resolves the inspector-authored flock list. If `flocks` is empty (the
         // common single-flock case), synthesizes one entry from the legacy fallback
         // fields. Also computes resolvedTotalBirdCount and the per-flock palette.
@@ -546,6 +630,15 @@ namespace Bird_behiviour.Flocking.Compute
             float dt = math.min(Time.deltaTime, maxSimDt) * simSpeedMultiplier;
             if (dt <= 0f) return;
 
+            // P3 live-tuning: re-read the inspector's flock configs + re-upload
+            // every frame so weights/colors/cursor/etc respond to slider drags
+            // without a Restart. This is cheap — flockSettingsBuffer is at most
+            // 256 entries × 96 bytes = 24 KB. Structural changes (birdCount per
+            // flock, flock count) still require Restart Sim — see the context-
+            // menu button below.
+            ResolveFlockSettingsLive();
+            UploadFlockSettings();
+
             int total = resolvedTotalBirdCount;
 
             // ── Push constants ──────────────────────────────────────────────────
@@ -643,7 +736,12 @@ namespace Bird_behiviour.Flocking.Compute
             if (Mouse.current == null) return;
             Vector2 mp2 = Mouse.current.position.ReadValue();
             Vector3 mp = new Vector3(mp2.x, mp2.y, 0f);
-            if (mp.x < 0 || mp.y < 0 || mp.x > Screen.width || mp.y > Screen.height) return;
+            // Editor quirk: Mouse.current.position can report values outside
+            // [0..Screen.width/height] when the cursor is over a different editor
+            // panel. Project the ray anyway — distant projected points naturally
+            // fall outside cursorReactionRadius so no birds react. Only reject the
+            // edge case where the ray points away from the plane (would require
+            // negative t).
             Ray r = cam.ScreenPointToRay(mp);
             if (math.abs(r.direction.y) < 1e-5f) return;
             float t = (cursorPlaneY - r.origin.y) / r.direction.y;

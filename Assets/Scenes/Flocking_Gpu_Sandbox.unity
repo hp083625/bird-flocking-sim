@@ -615,38 +615,38 @@ MonoBehaviour:
   - name: Prey
     birdCount: 18000
     color: {r: 0.4, g: 0.7, b: 1, a: 1}
-    perceptionRadius: 5
+    perceptionRadius: 6
     separationRadius: 1.5
-    perceptionConeHalfAngleRadians: 2.356194
+    perceptionConeHalfAngleRadians: 3.14159
     minSpeed: 1
     maxSpeed: 10
-    maxAcceleration: 30
+    maxAcceleration: 40
     inSeparationWeight: 1.5
     inAlignmentWeight: 1
     inCohesionWeight: 1
-    outSeparationWeight: 5
+    outSeparationWeight: 20
     outAlignmentWeight: 0
     outCohesionWeight: 0
-    cursorReactionStrength: -3
-    cursorReactionRadius: 12
+    cursorReactionStrength: -80
+    cursorReactionRadius: 30
     preferredCenter: {x: 0, y: 0, z: 0}
     preferredExtents: {x: 25, y: 10, z: 25}
     preferredAttractionWeight: 1
   - name: Predator
     birdCount: 2000
     color: {r: 0.95, g: 0.1, b: 0.1, a: 1}
-    perceptionRadius: 8
+    perceptionRadius: 12
     separationRadius: 2
-    perceptionConeHalfAngleRadians: 2.356194
-    minSpeed: 1.5
-    maxSpeed: 12
-    maxAcceleration: 35
+    perceptionConeHalfAngleRadians: 3.14159
+    minSpeed: 2
+    maxSpeed: 14
+    maxAcceleration: 50
     inSeparationWeight: 1.5
-    inAlignmentWeight: 0.5
-    inCohesionWeight: 0.5
+    inAlignmentWeight: 0.3
+    inCohesionWeight: 0.3
     outSeparationWeight: 0
     outAlignmentWeight: 0
-    outCohesionWeight: 5
+    outCohesionWeight: 15
     cursorReactionStrength: 0
     cursorReactionRadius: 10
     preferredCenter: {x: 0, y: 5, z: 0}

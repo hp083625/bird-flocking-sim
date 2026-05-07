@@ -107,6 +107,12 @@ float  _WorldBoundsMargin;
 float3 _CursorWorldPoint;
 uint   _CursorOnScreen; // 0 or 1; bool-like for SetInt
 
+// P5 split-K-NN sizes — file-scope #defines because HLSL → Metal can't always
+// accept a function-scope `const uint` as a stack-array size; the size must
+// resolve at parse time and a top-level macro is the most portable.
+#define K_IN 6
+#define K_OUT 4
+
 // ── Hash helpers ──────────────────────────────────────────────────────────────
 //
 // P2 grid: a flat index x + y*Gx + z*Gx*Gy. Cells outside the grid are clamped
@@ -501,15 +507,12 @@ void CSSteerTopoK(uint3 tid : SV_DispatchThreadID)
     float speedSq = dot(selfVel, selfVel);
     bool  hasHeading = (speedSq > 1e-8f);
 
-    // K-NN state — register-resident.
-    const uint KMAX = 8;
-    uint  knnIds[KMAX];
-    float knnSqDist[KMAX];
-    [unroll] for (uint kk = 0; kk < KMAX; ++kk)
-    {
-        knnIds[kk]    = 0xFFFFFFFFu;
-        knnSqDist[kk] = 1e30f;
-    }
+    // SPLIT K-NN: K_IN slots for in-flock neighbours + K_OUT for out-of-flock.
+    // (Sizes defined at file scope above.)
+    uint  inIds[K_IN];   float inSq[K_IN];
+    uint  outIds[K_OUT]; float outSq[K_OUT];
+    [unroll] for (uint kk = 0; kk < K_IN;  ++kk) { inIds[kk]  = 0xFFFFFFFFu; inSq[kk]  = 1e30f; }
+    [unroll] for (uint kk2 = 0; kk2 < K_OUT; ++kk2) { outIds[kk2] = 0xFFFFFFFFu; outSq[kk2] = 1e30f; }
 
     // 27-cell walk — gather K-NN candidates that pass the perception cone test.
     [unroll] for (int dz = -1; dz <= 1; ++dz)
@@ -537,13 +540,14 @@ void CSSteerTopoK(uint3 tid : SV_DispatchThreadID)
                     uint j = entry.y;
                     if (j == i) continue;
 
-                    float3 nbPos = _Boids[j].pos;
+                    Boid nbProbe = _Boids[j];
+                    float3 nbPos = nbProbe.pos;
+                    bool sameFlock = (nbProbe.flockId == selfFlock);
                     float3 toN = nbPos - selfPos;
                     float distSq = dot(toN, toN);
                     if (distSq > perceptSq || distSq <= 1e-12f) continue;
 
-                    // Perception cone test: dot(unit selfVel, unit toN) >= cosHalfAngle.
-                    // Skipped when bird is motionless (360° fallback).
+                    // Perception cone test (cheap rsqrt + dot). Skipped for motionless self.
                     if (hasHeading)
                     {
                         float dotRaw = dot(selfVel, toN);
@@ -552,72 +556,92 @@ void CSSteerTopoK(uint3 tid : SV_DispatchThreadID)
                         if (cosTheta < s.perceptionConeCos) continue;
                     }
 
-                    // Insert into K-NN if closer than the current K-th element.
-                    if (distSq < knnSqDist[KMAX - 1u])
+                    if (sameFlock)
                     {
-                        uint pos = KMAX - 1u;
-                        [unroll] for (uint shift = 0; shift < KMAX - 1u; ++shift)
+                        if (distSq < inSq[K_IN - 1u])
                         {
-                            uint p = KMAX - 1u - shift;
-                            if (p > 0u && knnSqDist[p - 1u] > distSq)
+                            uint pos = K_IN - 1u;
+                            [unroll] for (uint shift = 0; shift < K_IN - 1u; ++shift)
                             {
-                                knnSqDist[p] = knnSqDist[p - 1u];
-                                knnIds[p]    = knnIds[p - 1u];
-                                pos = p - 1u;
+                                uint p = K_IN - 1u - shift;
+                                if (p > 0u && inSq[p - 1u] > distSq)
+                                {
+                                    inSq[p]  = inSq[p - 1u];
+                                    inIds[p] = inIds[p - 1u];
+                                    pos = p - 1u;
+                                }
+                                else { pos = p; break; }
                             }
-                            else
-                            {
-                                pos = p;
-                                break;
-                            }
+                            inSq[pos]  = distSq;
+                            inIds[pos] = j;
                         }
-                        knnSqDist[pos] = distSq;
-                        knnIds[pos]    = j;
+                    }
+                    else
+                    {
+                        if (distSq < outSq[K_OUT - 1u])
+                        {
+                            uint pos = K_OUT - 1u;
+                            [unroll] for (uint shift = 0; shift < K_OUT - 1u; ++shift)
+                            {
+                                uint p = K_OUT - 1u - shift;
+                                if (p > 0u && outSq[p - 1u] > distSq)
+                                {
+                                    outSq[p]  = outSq[p - 1u];
+                                    outIds[p] = outIds[p - 1u];
+                                    pos = p - 1u;
+                                }
+                                else { pos = p; break; }
+                            }
+                            outSq[pos]  = distSq;
+                            outIds[pos] = j;
+                        }
                     }
                 }
             }
         }
     }
 
-    // Accumulate forces — split in/out of flock so the cross-flock weight branch
-    // happens once per K-NN slot (cheap), not per candidate (expensive).
+    // Accumulate forces from the SPLIT K-NN buckets — every bird sees up to K_IN
+    // same-flock neighbours and up to K_OUT other-flock neighbours.
     float sepRSq = s.separationRadius * s.separationRadius;
 
     float3 sepIn  = float3(0, 0, 0);  float3 aliInS  = float3(0, 0, 0);  float3 cohInS  = float3(0, 0, 0);  uint countIn  = 0;
     float3 sepOut = float3(0, 0, 0);  float3 aliOutS = float3(0, 0, 0);  float3 cohOutS = float3(0, 0, 0);  uint countOut = 0;
 
-    [unroll] for (uint kk2 = 0; kk2 < KMAX; ++kk2)
+    [unroll] for (uint ki = 0; ki < K_IN; ++ki)
     {
-        if (knnIds[kk2] == 0xFFFFFFFFu) break;
-        Boid nb = _Boids[knnIds[kk2]];
-        float distSq = knnSqDist[kk2];
-        bool sameFlock = (nb.flockId == selfFlock);
-
-        // Per-pair separation contribution.
-        float3 sepContrib = float3(0, 0, 0);
+        if (inIds[ki] == 0xFFFFFFFFu) break;
+        Boid nb = _Boids[inIds[ki]];
+        float distSq = inSq[ki];
         if (distSq < sepRSq)
         {
             float3 toN = nb.pos - selfPos;
             float invD = rsqrt(distSq);
             float dist = distSq * invD;
             float fall = 1.0f - dist / s.separationRadius;
-            sepContrib = -toN * (invD * fall);
+            sepIn -= toN * (invD * fall);
         }
+        aliInS += nb.vel;
+        cohInS += nb.pos;
+        countIn++;
+    }
 
-        if (sameFlock)
+    [unroll] for (uint ko = 0; ko < K_OUT; ++ko)
+    {
+        if (outIds[ko] == 0xFFFFFFFFu) break;
+        Boid nb = _Boids[outIds[ko]];
+        float distSq = outSq[ko];
+        if (distSq < sepRSq)
         {
-            sepIn  += sepContrib;
-            aliInS += nb.vel;
-            cohInS += nb.pos;
-            countIn++;
+            float3 toN = nb.pos - selfPos;
+            float invD = rsqrt(distSq);
+            float dist = distSq * invD;
+            float fall = 1.0f - dist / s.separationRadius;
+            sepOut -= toN * (invD * fall);
         }
-        else
-        {
-            sepOut += sepContrib;
-            aliOutS += nb.vel;
-            cohOutS += nb.pos;
-            countOut++;
-        }
+        aliOutS += nb.vel;
+        cohOutS += nb.pos;
+        countOut++;
     }
 
     // Reynolds alignment + cohesion folded through the in/out branch.
@@ -671,7 +695,12 @@ void CSSteerTopoK(uint3 tid : SV_DispatchThreadID)
     }
 
     // Cursor force — signed reaction with smoothstep falloff inside cursorRadius.
+    // When cursor is hot (within range), ali/coh are scaled down so the scatter
+    // doesn't get overwhelmed by herd-following — without this gating, alignment
+    // forces of ~20 units fight a cursor force of ~25 to a draw and birds barely
+    // visibly react.
     float3 cursorForce = float3(0, 0, 0);
+    float herdGain = 1.0f;
     if (_CursorOnScreen != 0u && s.cursorReactionStrength != 0.0f && s.cursorReactionRadius > 0.0f)
     {
         float3 toCursor = _CursorWorldPoint - selfPos;
@@ -686,10 +715,13 @@ void CSSteerTopoK(uint3 tid : SV_DispatchThreadID)
             float magnitude = abs(s.cursorReactionStrength) * falloff;
             float sgn = s.cursorReactionStrength >= 0.0f ? 1.0f : -1.0f;
             cursorForce = toCursor * (invD * magnitude * sgn);
+            // Suppress herd-following while the cursor is firing on this bird.
+            // herdGain → 0 at cursor center, → 1 at the radius boundary.
+            herdGain = 1.0f - falloff;
         }
     }
 
-    float3 a = sep + ali + coh + boundsForce + hardBounds + cursorForce;
+    float3 a = sep + (ali + coh) * herdGain + boundsForce + hardBounds + cursorForce;
 
     // Cap acceleration.
     float maxASq = s.maxAcceleration * s.maxAcceleration;
