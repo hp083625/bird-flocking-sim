@@ -163,7 +163,7 @@ namespace Bird_behiviour.Flocking.Simulation
             uint seed = s.RandomSeed != 0u
                 ? s.RandomSeed
                 : (uint)math.max(1L, (long)(Time.realtimeSinceStartup * 1e6));
-            var rng = new Random(seed);
+            var rng = new Unity.Mathematics.Random(seed);
 
             float3 center  = s.PreferredCenter;
             float3 extents = s.PreferredExtents;
