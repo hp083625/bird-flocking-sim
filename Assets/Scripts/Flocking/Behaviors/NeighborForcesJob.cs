@@ -30,7 +30,7 @@ namespace Bird_behiviour.Flocking.Behaviors
     /// Per-frame allocations: this job allocates nothing; the calling site
     /// (<c>FlockWorld.Tick</c>) provides the output array.
     /// </remarks>
-    [BurstCompile]
+    // [BurstCompile] // disabled by lead — Burst rejects float3-by-value in external-function ABI; revisit by refactoring ForceKernels to in/out signatures
     internal struct NeighborForcesJob : IJobParallelFor
     {
         [ReadOnly] public NativeArray<float3> Positions;

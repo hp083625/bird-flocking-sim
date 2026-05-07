@@ -7,6 +7,7 @@
 using System.Collections.Generic;
 using Bird_behiviour.Flocking.Behaviors;
 using Bird_behiviour.Flocking.Core;
+using Bird_behiviour.Flocking.Rendering;
 using Bird_behiviour.Flocking.Spatial;
 using Unity.Collections;
 using Unity.Jobs;
@@ -59,8 +60,18 @@ namespace Bird_behiviour.Flocking.Simulation
         /// <summary>Inner-loop batch size used when scheduling steering IJobParallelFors (Slice 4 / M3).</summary>
         internal int SteeringBatchSize => steeringBatchSize;
 
+        [Header("Rendering")]
+        [Tooltip("Per-bird sphere radius used by FrustumCullJob to pad the 6 frustum-plane tests so birds don't pop in/out at the edge. ~2× visual bird size is a safe default.")]
+        [SerializeField, Min(0f)] private float birdCullRadius = 0.5f;
+
+        /// <summary>Per-bird padding radius (world units) used by <see cref="Bird_behiviour.Flocking.Rendering.FrustumCullJob"/>.</summary>
+        public float BirdCullRadius => birdCullRadius;
+
         // ── Profiler markers (Slice 4 / M3 — read by M5 HUD + Unity Profiler) ─────────
         private static readonly ProfilerMarker BuildGridMarker = new ProfilerMarker("Flock.BuildGrid");
+        // Slice 8 / M4 — cull + matrices job markers (per FLOCKING_PLAN §6 M5-5 names).
+        private static readonly ProfilerMarker CullMarker      = new ProfilerMarker("Flock.Cull");
+        private static readonly ProfilerMarker MatricesMarker  = new ProfilerMarker("Flock.Matrices");
 
         /// <inheritdoc/>
         public float3 WorldBoundsCenter   => worldBoundsCenter;
@@ -111,13 +122,59 @@ namespace Bird_behiviour.Flocking.Simulation
         public NativeArray<byte>       FlockIds;
         /// <summary>One <see cref="FlockSlice"/> per registered flock.</summary>
         public NativeArray<FlockSlice> Slices;
-        /// <summary>Per-bird world matrix recomputed every <see cref="Tick"/> (translation + look-along-velocity).</summary>
-        public NativeArray<float4x4>   Matrices;
+
+        // ── Per-flock visible-render buffers (Slice 8 / M4) ──────────────────────────
+        //
+        // Slice 8 picks the **per-flock cull** strategy from FLOCKING_PLAN §6 M4-4:
+        // every registered flock owns a NativeList<int> of post-cull global bird indices
+        // and a packed NativeArray<float4x4> of matrices for those visible birds. The
+        // alternative — global cull + per-flock filter pass — would force the renderer
+        // to either iterate everyone or maintain a flock-id parallel array; per-flock
+        // cull jobs are independent (no cross-flock contention), the per-flock list
+        // capacity is the flock's BirdCount (worst case all visible) so AddNoResize is
+        // wait-free, and downstream the renderer just consumes [0, list.Length) directly.
+        //
+        // Cost: N parallel cull dispatches instead of one. With v1's N ≤ 2 this is a
+        // rounding-error overhead next to the steering chain.
+        private NativeList<int>[]      visibleIndicesPerFlock     = System.Array.Empty<NativeList<int>>();
+        private NativeArray<float4x4>[] visibleMatricesPerFlock   = System.Array.Empty<NativeArray<float4x4>>();
 
         /// <summary>Sum of every registered flock's <c>BirdCount</c>.</summary>
         public int TotalBirdCount { get; private set; }
 
         private bool arraysAllocated;
+
+        // Tracks the tail of the most recent Tick's job graph. DisposeArrays /
+        // OnDestroy drains it before deallocating the NativeArrays the jobs touched —
+        // without this, exiting Play mid-tick throws "JobHandle.Complete() before
+        // you can deallocate ... safely".
+        private JobHandle pendingTickHandle;
+
+        // ── Camera frustum cache (Slice 8 / M4) ──────────────────────────────────────
+        //
+        // 6 planes encoded as float4 (xyz = inward-facing normal, w = signed distance);
+        // a point p is inside the frustum iff dot(plane.xyz, p) + plane.w >= 0 for every
+        // plane. We allocate Persistent + length 6 once in Awake (re-used every frame),
+        // and refresh from Camera.main inside Tick. Tests can override via
+        // <see cref="SetCameraFrustumPlanesForTest"/> which writes the array directly.
+        //
+        // Default (zero-initialised) state means EVERY plane test passes — i.e. no
+        // culling — so a missing camera or pre-Awake state degrades gracefully to "render
+        // all birds" rather than to a black screen.
+        private NativeArray<float4> cameraFrustumPlanes;
+
+        // Reusable Plane[6] scratch for GeometryUtility.CalculateFrustumPlanes(camera, planes).
+        // The overload that takes a Plane[] avoids the per-call allocation that the
+        // returning-Plane[] overload would otherwise incur.
+        private readonly UnityEngine.Plane[] frustumPlaneScratch = new UnityEngine.Plane[6];
+
+        // When true (set by <see cref="SetCameraFrustumPlanesForTest"/>), Tick skips the
+        // Camera.main lookup + plane recompute — tests own the cache for the rest of the
+        // run. Cleared by <see cref="ClearCameraFrustumPlanesOverride"/>.
+        private bool frustumPlanesOverridden;
+
+        /// <summary>Read-only view of the cached 6 camera frustum planes (xyz = inward normal, w = distance).</summary>
+        public NativeArray<float4>.ReadOnly CameraFrustumPlanes => cameraFrustumPlanes.AsReadOnly();
 
         // ── Spatial index (Slice 3 / M2) ─────────────────────────────────────────────
 
@@ -216,7 +273,18 @@ namespace Bird_behiviour.Flocking.Simulation
             Velocities    = new NativeArray<float3>(allocLen, Allocator.Persistent, NativeArrayOptions.ClearMemory);
             Accelerations = new NativeArray<float3>(allocLen, Allocator.Persistent, NativeArrayOptions.ClearMemory);
             FlockIds      = new NativeArray<byte>  (allocLen, Allocator.Persistent, NativeArrayOptions.ClearMemory);
-            Matrices      = new NativeArray<float4x4>(allocLen, Allocator.Persistent, NativeArrayOptions.ClearMemory);
+
+            // Per-flock visible buffers. Each list's capacity = flock.Count (worst case
+            // all birds visible) so the cull job's AddNoResize is wait-free; matrices
+            // array is sized to the same upper bound, with only [0, list.Length) populated.
+            visibleIndicesPerFlock   = new NativeList<int>[registered.Count];
+            visibleMatricesPerFlock  = new NativeArray<float4x4>[registered.Count];
+            for (int f = 0; f < registered.Count; f++)
+            {
+                int cap = math.max(1, Slices[f].Count);
+                visibleIndicesPerFlock[f]  = new NativeList<int>(cap, Allocator.Persistent);
+                visibleMatricesPerFlock[f] = new NativeArray<float4x4>(cap, Allocator.Persistent, NativeArrayOptions.UninitializedMemory);
+            }
 
             // Stamp FlockIds across each slice once.
             for (int f = 0; f < registered.Count; f++)
@@ -278,12 +346,30 @@ namespace Bird_behiviour.Flocking.Simulation
             {
                 return;
             }
+            // Drain any in-flight Tick before deallocating arrays the jobs touched —
+            // necessary when Play exits mid-tick, on domain reload, or if Tick threw
+            // before reaching its own Complete() call.
+            pendingTickHandle.Complete();
+            pendingTickHandle = default;
             if (Positions.IsCreated)     Positions.Dispose();
             if (Velocities.IsCreated)    Velocities.Dispose();
             if (Accelerations.IsCreated) Accelerations.Dispose();
             if (FlockIds.IsCreated)      FlockIds.Dispose();
             if (Slices.IsCreated)        Slices.Dispose();
-            if (Matrices.IsCreated)      Matrices.Dispose();
+
+            // Per-flock visible buffers (Slice 8 / M4) — disposed alongside the per-bird
+            // arrays so they share the same lifetime contract.
+            for (int f = 0; f < visibleIndicesPerFlock.Length; f++)
+            {
+                if (visibleIndicesPerFlock[f].IsCreated)  visibleIndicesPerFlock[f].Dispose();
+            }
+            for (int f = 0; f < visibleMatricesPerFlock.Length; f++)
+            {
+                if (visibleMatricesPerFlock[f].IsCreated) visibleMatricesPerFlock[f].Dispose();
+            }
+            visibleIndicesPerFlock  = System.Array.Empty<NativeList<int>>();
+            visibleMatricesPerFlock = System.Array.Empty<NativeArray<float4x4>>();
+
             arraysAllocated = false;
         }
 
@@ -347,10 +433,80 @@ namespace Bird_behiviour.Flocking.Simulation
 
         // ── Unity lifecycle ──────────────────────────────────────────────────────────
 
+        private void Awake()
+        {
+            // Allocate the 6-plane frustum cache once per FlockWorld lifetime so Tick is
+            // alloc-free. Default contents are zero → every plane test passes (visible),
+            // which is the desired fail-safe (no Camera.main yet → no culling).
+            if (!cameraFrustumPlanes.IsCreated)
+            {
+                cameraFrustumPlanes = new NativeArray<float4>(6, Allocator.Persistent, NativeArrayOptions.ClearMemory);
+            }
+        }
+
         private void OnDestroy()
         {
             DisposeArrays();
             DisposeSpatialIndex();
+            if (cameraFrustumPlanes.IsCreated)
+            {
+                cameraFrustumPlanes.Dispose();
+            }
+        }
+
+        /// <summary>
+        /// Refreshes <see cref="CameraFrustumPlanes"/> from the supplied camera. Called from
+        /// <see cref="Tick"/> with <see cref="Camera.main"/> in production; tests use
+        /// <see cref="SetCameraFrustumPlanesForTest"/> instead.
+        /// </summary>
+        /// <remarks>
+        /// Uses the <c>GeometryUtility.CalculateFrustumPlanes(Camera, Plane[])</c> overload
+        /// that writes into a pre-allocated buffer to avoid the per-frame managed alloc the
+        /// returning-Plane[] overload would otherwise incur.
+        /// <para/>
+        /// GeometryUtility's planes have <em>inward-facing</em> normals, so a point <c>p</c>
+        /// is inside the frustum iff <c>dot(n, p) + d &gt;= 0</c> for every plane — which is
+        /// exactly what <c>FrustumCullJob</c> assumes.
+        /// </remarks>
+        private void UpdateCameraFrustumPlanesFrom(Camera cam)
+        {
+            if (cam == null || !cameraFrustumPlanes.IsCreated)
+            {
+                return;
+            }
+            GeometryUtility.CalculateFrustumPlanes(cam, frustumPlaneScratch);
+            for (int i = 0; i < 6; i++)
+            {
+                UnityEngine.Plane p = frustumPlaneScratch[i];
+                cameraFrustumPlanes[i] = new float4(p.normal.x, p.normal.y, p.normal.z, p.distance);
+            }
+        }
+
+        /// <summary>
+        /// Test hook: writes the 6 frustum planes directly into the cache and pins them so
+        /// subsequent <see cref="Tick"/> calls do <em>not</em> overwrite them from
+        /// <see cref="Camera.main"/>. Intended for headless PlayMode tests that don't want
+        /// to set up a real <c>MainCamera</c>.
+        /// </summary>
+        /// <param name="planes">Source array of length 6 (xyz = inward normal, w = distance).</param>
+        public void SetCameraFrustumPlanesForTest(NativeArray<float4> planes)
+        {
+            if (!cameraFrustumPlanes.IsCreated)
+            {
+                cameraFrustumPlanes = new NativeArray<float4>(6, Allocator.Persistent, NativeArrayOptions.ClearMemory);
+            }
+            int n = math.min(6, planes.Length);
+            for (int i = 0; i < n; i++)
+            {
+                cameraFrustumPlanes[i] = planes[i];
+            }
+            frustumPlanesOverridden = true;
+        }
+
+        /// <summary>Clears the test-only override set by <see cref="SetCameraFrustumPlanesForTest"/>; subsequent ticks resume reading from <see cref="Camera.main"/>.</summary>
+        public void ClearCameraFrustumPlanesOverride()
+        {
+            frustumPlanesOverridden = false;
         }
 
         private void LateUpdate()
@@ -379,6 +535,12 @@ namespace Bird_behiviour.Flocking.Simulation
             {
                 return;
             }
+
+            // Drain any tail of the previous Tick before scheduling new jobs against
+            // the same arrays. The end-of-Tick Complete() should already have done this,
+            // but if the prior frame was interrupted (PlayMode pause, recompile,
+            // exception) the safety system can still see outstanding writes — be defensive.
+            pendingTickHandle.Complete();
 
             // ── 1. Schedule the cell-list spatial grid build (Slice 3 / M2). ──────────
             //
@@ -425,43 +587,123 @@ namespace Bird_behiviour.Flocking.Simulation
                 WorldBoundsExtents = WorldBoundsExtents,
                 WorldBoundsWeight  = WorldBoundsWeight,
                 WorldBoundsMargin  = worldMargin,
+                CursorWorldPoint   = CursorWorldPoint,
+                CursorOnScreen     = CursorOnScreen,
                 BirdCount          = TotalBirdCount,
                 BatchSize          = SteeringBatchSize,
                 Dt                 = dt,
                 GridHandle         = gridHandle,
             };
 
-            // ── 3. Schedule the parallel job graph + complete on the main thread ────
-            JobHandle integrateH = SteeringJobGraph.Dispatch(in spec);
-            integrateH.Complete();
+            // Refresh the camera frustum cache once per Tick (alloc-free; reuses Plane[6]
+            // scratch and the Persistent NativeArray<float4>(6) allocated in Awake).
+            // Tests can override via SetCameraFrustumPlanesForTest in which case we skip.
+            Camera cam = Camera.main;
+            if (!frustumPlanesOverridden)
+            {
+                UpdateCameraFrustumPlanesFrom(cam);
+            }
 
-            // Dispose per-frame TempJob buffers now that IntegrateJob has consumed them.
+            // Snapshot positions so FrustumCullJob can run in parallel with IntegrateJob
+            // without tripping the safety system (cull is [ReadOnly] on its position
+            // input; integrate is read-write on Positions). MUST happen BEFORE Dispatch
+            // schedules IntegrateJob — otherwise the synchronous main-thread copy ctor
+            // would read Positions while a writer is pending. The snapshot reflects
+            // pre-integrate positions; BirdCullRadius (~2× bird size) absorbs the
+            // MaxSpeed*dt drift between snapshot and final integrated positions.
+            var cullPositions = new NativeArray<float3>(Positions, Allocator.TempJob);
+
+            // ── 3. Schedule the steering chain (cell-list → 3 force jobs → Integrate)
+            //      AND the per-flock cull jobs in parallel — cull has no grid/steering
+            //      dependency, so both branches share worker-thread time. ─────────────
+            JobHandle integrateH = SteeringJobGraph.Dispatch(in spec);
+
+            // Per-flock cull → matrices chain. Cull reads `cullPositions` (snapshot),
+            // matrices reads `Positions` (post-integrate) — so matrices for flock f
+            // fans in on CombineDependencies(cullH[f], integrateH).
+            JobHandle matricesAllH = ScheduleCullAndMatrices(integrateH, BirdCullRadius, cullPositions);
+            pendingTickHandle = matricesAllH; // tracked for safe Dispose if Play stops mid-tick
+
+            // Single sync point: drains steering chain AND every flock's cull + matrices.
+            matricesAllH.Complete();
+
+            // Dispose per-frame TempJob buffers now that consumers have completed.
             accelNeighbor.Dispose();
             accelBounds.Dispose();
             accelCursor.Dispose();
             kernelSettings.Dispose();
+            cullPositions.Dispose();
 
-            // ── 4. Build world matrices (translation + look-along-velocity). ─────────
-            BuildMatrices();
-
-            // ── 5. Dispatch per-flock rendering. ────────────────────────────────────
-            DispatchRendering();
+            // ── 4. Dispatch per-flock rendering off the now-populated visible buffers.
+            DispatchRendering(cam);
         }
 
-        private void BuildMatrices()
+        /// <summary>
+        /// Schedules one <see cref="FrustumCullJob"/> + one <see cref="BuildMatricesJob"/>
+        /// per registered flock, returning a combined <see cref="JobHandle"/> the caller
+        /// completes alongside the steering chain.
+        /// </summary>
+        /// <remarks>
+        /// Cull jobs read the supplied <paramref name="cullPositions"/> snapshot (so they
+        /// can run in parallel with IntegrateJob's writes to <see cref="Positions"/>) and
+        /// write into per-flock <c>NativeList&lt;int&gt;</c>s pre-sized to the flock's
+        /// bird count. The matrices job for flock <c>f</c> uses
+        /// <c>visibleIndicesPerFlock[f].AsDeferredJobArray()</c> so its iteration count is
+        /// resolved at job-start from the cull's output length — no main-thread sync
+        /// between cull and matrices. The matrices job reads the *post-integration*
+        /// <see cref="Positions"/> and <see cref="Velocities"/>, so it depends on
+        /// CombineDependencies(cullH, integrateH).
+        /// </remarks>
+        private JobHandle ScheduleCullAndMatrices(JobHandle integrateH, float birdRadius, NativeArray<float3> cullPositions)
         {
-            for (int i = 0; i < TotalBirdCount; i++)
+            JobHandle combinedH = integrateH; // ensures the caller's single Complete() drains everything
+            int batch = math.max(1, SteeringBatchSize);
+
+            for (int f = 0; f < registered.Count; f++)
             {
-                float3 pos = Positions[i];
-                float3 vel = Velocities[i];
-                quaternion rot = quaternion.LookRotationSafe(vel, math.up());
-                Matrices[i] = float4x4.TRS(pos, rot, new float3(1f, 1f, 1f));
+                FlockSlice slice = Slices[f];
+                if (slice.Count == 0) continue;
+
+                NativeList<int> visList = visibleIndicesPerFlock[f];
+                visList.Clear(); // reset Length to 0; capacity (= slice.Count) is preserved.
+
+                JobHandle cullH;
+                using (CullMarker.Auto())
+                {
+                    cullH = new FrustumCullJob
+                    {
+                        Positions             = cullPositions,
+                        CameraFrustumPlanes   = cameraFrustumPlanes,
+                        StartIndex            = slice.StartIndex,
+                        BirdRadius            = birdRadius,
+                        VisibleIndicesWriter  = visList.AsParallelWriter(),
+                    }.Schedule(slice.Count, batch, default);
+                }
+
+                JobHandle matricesH;
+                using (MatricesMarker.Auto())
+                {
+                    var matricesJob = new BuildMatricesJob
+                    {
+                        VisibleIndices  = visList.AsDeferredJobArray(),
+                        Positions       = Positions,
+                        Velocities      = Velocities,
+                        VisibleMatrices = visibleMatricesPerFlock[f],
+                    };
+                    // IJobParallelForDefer.Schedule resolves the iteration count from
+                    // visList's length at job-start time — no need to Complete cullH.
+                    matricesH = matricesJob.Schedule(visList, batch,
+                        JobHandle.CombineDependencies(cullH, integrateH));
+                }
+
+                combinedH = JobHandle.CombineDependencies(combinedH, matricesH);
             }
+
+            return combinedH;
         }
 
-        private void DispatchRendering()
+        private void DispatchRendering(Camera cam)
         {
-            Camera cam = Camera.main;
             for (int f = 0; f < registered.Count; f++)
             {
                 FlockManager mgr = registered[f];
@@ -473,14 +715,47 @@ namespace Bird_behiviour.Flocking.Simulation
                 }
 
                 FlockSlice slice = Slices[f];
-                NativeArray<float4x4>.ReadOnly readOnlyMatrices = Matrices.AsReadOnly();
+                if (slice.Count == 0) continue;
 
-                // Slice 2: pass the full Matrices array but tell the renderer to start at
-                // slice.StartIndex by giving it a sub-slice. NativeArray<T>.GetSubArray is
-                // safe and free.
-                NativeArray<float4x4> sub = Matrices.GetSubArray(slice.StartIndex, slice.Count);
-                renderer.Render(slice, s.BirdMesh, s.BirdMaterial, sub.AsReadOnly(), slice.Count, cam);
+                int visibleCount = visibleIndicesPerFlock[f].Length;
+                if (visibleCount <= 0) continue;
+
+                renderer.Render(
+                    slice,
+                    s.BirdMesh,
+                    s.BirdMaterial,
+                    visibleMatricesPerFlock[f].AsReadOnly(),
+                    visibleCount,
+                    cam);
             }
+        }
+
+        // ── Test-only accessor for visible-bird counts after a Tick (Slice 8 / M4) ──
+        /// <summary>
+        /// Returns the count of birds in flock <paramref name="flockId"/> that survived
+        /// frustum culling on the most recent <see cref="Tick"/>. Returns 0 if the flock
+        /// id is out of range or no Tick has run yet. PlayMode-test only.
+        /// </summary>
+        public int GetVisibleCountForTest(int flockId)
+        {
+            if (flockId < 0 || flockId >= visibleIndicesPerFlock.Length) return 0;
+            NativeList<int> list = visibleIndicesPerFlock[flockId];
+            return list.IsCreated ? list.Length : 0;
+        }
+
+        /// <summary>
+        /// Returns a copy of the global bird indices visible for flock <paramref name="flockId"/>
+        /// after the most recent <see cref="Tick"/>. Caller owns the returned array. PlayMode-test only.
+        /// </summary>
+        public int[] GetVisibleIndicesSnapshotForTest(int flockId)
+        {
+            if (flockId < 0 || flockId >= visibleIndicesPerFlock.Length) return System.Array.Empty<int>();
+            NativeList<int> list = visibleIndicesPerFlock[flockId];
+            if (!list.IsCreated || list.Length == 0) return System.Array.Empty<int>();
+            int n = list.Length;
+            int[] copy = new int[n];
+            for (int i = 0; i < n; i++) copy[i] = list[i];
+            return copy;
         }
 
         // ── Gizmos ────────────────────────────────────────────────────────────────────

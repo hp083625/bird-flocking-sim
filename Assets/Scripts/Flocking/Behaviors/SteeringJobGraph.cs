@@ -68,6 +68,11 @@ namespace Bird_behiviour.Flocking.Behaviors
             public float  WorldBoundsWeight;
             public float  WorldBoundsMargin;
 
+            /// <summary>Slice 7: cursor world-point read by <c>CursorForceJob</c> each tick.</summary>
+            public float3 CursorWorldPoint;
+            /// <summary>Slice 7: when false, <c>CursorForceJob</c> writes zero for every bird.</summary>
+            public bool   CursorOnScreen;
+
             public int    BirdCount;
             public int    BatchSize;
             public float  Dt;
@@ -116,13 +121,18 @@ namespace Bird_behiviour.Flocking.Behaviors
                 }.Schedule(n, batch, default);
             }
 
-            // ── Branch 3: Cursor (no-op stub for Slice 4) ───────────────────────────
+            // ── Branch 3: Cursor (Slice 7 — real signed-strength impl) ──────────────
             JobHandle cursorH;
             using (CursorMarker.Auto())
             {
                 cursorH = new CursorForceJob
                 {
-                    AccelCursor = spec.AccelCursor,
+                    Positions        = spec.Positions,
+                    FlockIds         = spec.FlockIds,
+                    KernelSettings   = spec.KernelSettings,
+                    CursorWorldPoint = spec.CursorWorldPoint,
+                    CursorOnScreen   = spec.CursorOnScreen,
+                    AccelCursor      = spec.AccelCursor,
                 }.Schedule(n, batch, default);
             }
 
