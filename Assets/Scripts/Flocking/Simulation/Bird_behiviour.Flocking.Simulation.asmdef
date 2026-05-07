@@ -3,6 +3,7 @@
     "rootNamespace": "Bird_behiviour.Flocking.Simulation",
     "references": [
         "Bird_behiviour.Flocking.Core",
+        "Bird_behiviour.Flocking.Rendering",
         "Unity.Burst",
         "Unity.Collections",
         "Unity.Mathematics"
