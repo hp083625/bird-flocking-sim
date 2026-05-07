@@ -101,5 +101,22 @@ namespace Bird_behiviour.Flocking.Spatial
         {
             grid.Dispose();
         }
+
+        // ── Gizmo / tooling readback (Slice 11) ──────────────────────────────────────
+        //
+        // World-space minimum corner of the grid AABB. Editor-only gizmo drawers use this
+        // alongside <see cref="CellsPerAxis"/> + <see cref="CellSize"/> to position cell
+        // wireframes. Returns float3.zero when the grid isn't allocated.
+        /// <summary>World-space min corner of the grid AABB; <c>float3.zero</c> if unallocated.</summary>
+        public float3 BoundsMin => grid.IsCreated ? grid.BoundsMin : float3.zero;
+
+        /// <summary>
+        /// Read-only view of the per-cell offset array (length = TotalCells + 1). Empty
+        /// slice when the grid isn't allocated. Each cell <c>i</c>'s occupancy is
+        /// <c>CellOffset[i+1] - CellOffset[i]</c>. Intended for editor-only gizmo / HUD
+        /// readers — do <em>not</em> hold this view across a <see cref="ScheduleBuild"/>.
+        /// </summary>
+        public NativeArray<int>.ReadOnly CellOffsetReadOnly =>
+            grid.IsCreated ? grid.CellOffset.AsReadOnly() : default;
     }
 }

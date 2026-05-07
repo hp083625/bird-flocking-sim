@@ -187,6 +187,9 @@ namespace Bird_behiviour.Flocking.Simulation
         /// <summary>Current grid cell size (max <c>PerceptionRadius</c> across registered flocks).</summary>
         public float CellSize => spatialIndex != null ? spatialIndex.CellSize : 0f;
 
+        /// <summary>The cell-list spatial grid this world owns. Used by Slice 11 gizmos for cell-occupancy readback. Null until the first flock registers.</summary>
+        public CellListSpatialIndex SpatialIndex => spatialIndex;
+
         // ── Registration API ──────────────────────────────────────────────────────────
 
         /// <summary>
@@ -720,28 +723,37 @@ namespace Bird_behiviour.Flocking.Simulation
                 int visibleCount = visibleIndicesPerFlock[f].Length;
                 if (visibleCount <= 0) continue;
 
+                // Slice 9: pass the NativeArray directly (no AsReadOnly) so the
+                // IndirectFlockRenderer can call GraphicsBuffer.SetData(NativeArray, ...)
+                // without a per-frame intermediate copy. Implementations contract is
+                // read-only; we don't enforce it via the type system to keep the hot
+                // path zero-overhead.
                 renderer.Render(
                     slice,
                     s.BirdMesh,
                     s.BirdMaterial,
-                    visibleMatricesPerFlock[f].AsReadOnly(),
+                    visibleMatricesPerFlock[f],
                     visibleCount,
                     cam);
             }
         }
 
-        // ── Test-only accessor for visible-bird counts after a Tick (Slice 8 / M4) ──
+        // ── Visible-bird-count accessor (Slice 8 / M4) ───────────────────────────────
         /// <summary>
         /// Returns the count of birds in flock <paramref name="flockId"/> that survived
         /// frustum culling on the most recent <see cref="Tick"/>. Returns 0 if the flock
-        /// id is out of range or no Tick has run yet. PlayMode-test only.
+        /// id is out of range or no Tick has run yet. Used by the runtime HUD (Slice 11)
+        /// and by PlayMode tests.
         /// </summary>
-        public int GetVisibleCountForTest(int flockId)
+        public int GetVisibleCount(int flockId)
         {
             if (flockId < 0 || flockId >= visibleIndicesPerFlock.Length) return 0;
             NativeList<int> list = visibleIndicesPerFlock[flockId];
             return list.IsCreated ? list.Length : 0;
         }
+
+        /// <summary>Backwards-compatible alias for tests that predate Slice 11's HUD.</summary>
+        public int GetVisibleCountForTest(int flockId) => GetVisibleCount(flockId);
 
         /// <summary>
         /// Returns a copy of the global bird indices visible for flock <paramref name="flockId"/>
