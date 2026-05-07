@@ -7,6 +7,7 @@
 using System.Collections.Generic;
 using Bird_behiviour.Flocking.Behaviors;
 using Bird_behiviour.Flocking.Core;
+using Bird_behiviour.Flocking.Rendering;
 using Bird_behiviour.Flocking.Spatial;
 using Unity.Collections;
 using Unity.Jobs;
@@ -121,8 +122,22 @@ namespace Bird_behiviour.Flocking.Simulation
         public NativeArray<byte>       FlockIds;
         /// <summary>One <see cref="FlockSlice"/> per registered flock.</summary>
         public NativeArray<FlockSlice> Slices;
-        /// <summary>Per-bird world matrix recomputed every <see cref="Tick"/> (translation + look-along-velocity).</summary>
-        public NativeArray<float4x4>   Matrices;
+
+        // ── Per-flock visible-render buffers (Slice 8 / M4) ──────────────────────────
+        //
+        // Slice 8 picks the **per-flock cull** strategy from FLOCKING_PLAN §6 M4-4:
+        // every registered flock owns a NativeList<int> of post-cull global bird indices
+        // and a packed NativeArray<float4x4> of matrices for those visible birds. The
+        // alternative — global cull + per-flock filter pass — would force the renderer
+        // to either iterate everyone or maintain a flock-id parallel array; per-flock
+        // cull jobs are independent (no cross-flock contention), the per-flock list
+        // capacity is the flock's BirdCount (worst case all visible) so AddNoResize is
+        // wait-free, and downstream the renderer just consumes [0, list.Length) directly.
+        //
+        // Cost: N parallel cull dispatches instead of one. With v1's N ≤ 2 this is a
+        // rounding-error overhead next to the steering chain.
+        private NativeList<int>[]      visibleIndicesPerFlock     = System.Array.Empty<NativeList<int>>();
+        private NativeArray<float4x4>[] visibleMatricesPerFlock   = System.Array.Empty<NativeArray<float4x4>>();
 
         /// <summary>Sum of every registered flock's <c>BirdCount</c>.</summary>
         public int TotalBirdCount { get; private set; }
@@ -252,7 +267,18 @@ namespace Bird_behiviour.Flocking.Simulation
             Velocities    = new NativeArray<float3>(allocLen, Allocator.Persistent, NativeArrayOptions.ClearMemory);
             Accelerations = new NativeArray<float3>(allocLen, Allocator.Persistent, NativeArrayOptions.ClearMemory);
             FlockIds      = new NativeArray<byte>  (allocLen, Allocator.Persistent, NativeArrayOptions.ClearMemory);
-            Matrices      = new NativeArray<float4x4>(allocLen, Allocator.Persistent, NativeArrayOptions.ClearMemory);
+
+            // Per-flock visible buffers. Each list's capacity = flock.Count (worst case
+            // all birds visible) so the cull job's AddNoResize is wait-free; matrices
+            // array is sized to the same upper bound, with only [0, list.Length) populated.
+            visibleIndicesPerFlock   = new NativeList<int>[registered.Count];
+            visibleMatricesPerFlock  = new NativeArray<float4x4>[registered.Count];
+            for (int f = 0; f < registered.Count; f++)
+            {
+                int cap = math.max(1, Slices[f].Count);
+                visibleIndicesPerFlock[f]  = new NativeList<int>(cap, Allocator.Persistent);
+                visibleMatricesPerFlock[f] = new NativeArray<float4x4>(cap, Allocator.Persistent, NativeArrayOptions.UninitializedMemory);
+            }
 
             // Stamp FlockIds across each slice once.
             for (int f = 0; f < registered.Count; f++)
@@ -319,7 +345,20 @@ namespace Bird_behiviour.Flocking.Simulation
             if (Accelerations.IsCreated) Accelerations.Dispose();
             if (FlockIds.IsCreated)      FlockIds.Dispose();
             if (Slices.IsCreated)        Slices.Dispose();
-            if (Matrices.IsCreated)      Matrices.Dispose();
+
+            // Per-flock visible buffers (Slice 8 / M4) — disposed alongside the per-bird
+            // arrays so they share the same lifetime contract.
+            for (int f = 0; f < visibleIndicesPerFlock.Length; f++)
+            {
+                if (visibleIndicesPerFlock[f].IsCreated)  visibleIndicesPerFlock[f].Dispose();
+            }
+            for (int f = 0; f < visibleMatricesPerFlock.Length; f++)
+            {
+                if (visibleMatricesPerFlock[f].IsCreated) visibleMatricesPerFlock[f].Dispose();
+            }
+            visibleIndicesPerFlock  = System.Array.Empty<NativeList<int>>();
+            visibleMatricesPerFlock = System.Array.Empty<NativeArray<float4x4>>();
+
             arraysAllocated = false;
         }
 
@@ -539,9 +578,29 @@ namespace Bird_behiviour.Flocking.Simulation
                 GridHandle         = gridHandle,
             };
 
-            // ── 3. Schedule the parallel job graph + complete on the main thread ────
+            // ── 3. Schedule the steering chain (cell-list → 3 force jobs → Integrate)
+            //      AND the per-flock cull jobs in parallel — cull has no grid/steering
+            //      dependency, so both branches share worker-thread time. ─────────────
             JobHandle integrateH = SteeringJobGraph.Dispatch(in spec);
-            integrateH.Complete();
+
+            // Refresh the camera frustum cache once per Tick (alloc-free; reuses Plane[6]
+            // scratch and the Persistent NativeArray<float4>(6) allocated in Awake).
+            // Tests can override via SetCameraFrustumPlanesForTest in which case we skip.
+            Camera cam = Camera.main;
+            if (!frustumPlanesOverridden)
+            {
+                UpdateCameraFrustumPlanesFrom(cam);
+            }
+
+            // Per-flock cull → matrices chain. Cull is independent of steering; the
+            // matrices job for flock f fans in on CombineDependencies(cullH[f], integrateH)
+            // because it reads the *integrated* positions/velocities and the cull's
+            // visible-index list (via IJobParallelForDefer.AsDeferredJobArray()).
+            JobHandle matricesAllH = ScheduleCullAndMatrices(integrateH, BirdCullRadius);
+
+            // Single sync point: completes the steering chain AND every flock's cull +
+            // matrices jobs (matricesAllH already depends on integrateH transitively).
+            matricesAllH.Complete();
 
             // Dispose per-frame TempJob buffers now that IntegrateJob has consumed them.
             accelNeighbor.Dispose();
@@ -549,27 +608,74 @@ namespace Bird_behiviour.Flocking.Simulation
             accelCursor.Dispose();
             kernelSettings.Dispose();
 
-            // ── 4. Build world matrices (translation + look-along-velocity). ─────────
-            BuildMatrices();
-
-            // ── 5. Dispatch per-flock rendering. ────────────────────────────────────
-            DispatchRendering();
+            // ── 4. Dispatch per-flock rendering off the now-populated visible buffers.
+            DispatchRendering(cam);
         }
 
-        private void BuildMatrices()
+        /// <summary>
+        /// Schedules one <see cref="FrustumCullJob"/> + one <see cref="BuildMatricesJob"/>
+        /// per registered flock, returning a combined <see cref="JobHandle"/> the caller
+        /// completes alongside the steering chain.
+        /// </summary>
+        /// <remarks>
+        /// Cull jobs depend on <c>default</c> (no inputs from steering) and write into
+        /// per-flock <c>NativeList&lt;int&gt;</c>s sized to the flock's bird count. The
+        /// matrices job for flock <c>f</c> uses
+        /// <c>visibleIndicesPerFlock[f].AsDeferredJobArray()</c> so its iteration count is
+        /// resolved at job-start from the cull's output length — no main-thread sync
+        /// between the two. Read the per-flock visible counts off
+        /// <c>visibleIndicesPerFlock[f].Length</c> after the returned handle completes.
+        /// </remarks>
+        private JobHandle ScheduleCullAndMatrices(JobHandle integrateH, float birdRadius)
         {
-            for (int i = 0; i < TotalBirdCount; i++)
+            JobHandle combinedH = integrateH; // ensures the caller's single Complete() drains everything
+            int batch = math.max(1, SteeringBatchSize);
+
+            for (int f = 0; f < registered.Count; f++)
             {
-                float3 pos = Positions[i];
-                float3 vel = Velocities[i];
-                quaternion rot = quaternion.LookRotationSafe(vel, math.up());
-                Matrices[i] = float4x4.TRS(pos, rot, new float3(1f, 1f, 1f));
+                FlockSlice slice = Slices[f];
+                if (slice.Count == 0) continue;
+
+                NativeList<int> visList = visibleIndicesPerFlock[f];
+                visList.Clear(); // reset Length to 0; capacity (= slice.Count) is preserved.
+
+                JobHandle cullH;
+                using (CullMarker.Auto())
+                {
+                    cullH = new FrustumCullJob
+                    {
+                        Positions             = Positions,
+                        CameraFrustumPlanes   = cameraFrustumPlanes,
+                        StartIndex            = slice.StartIndex,
+                        BirdRadius            = birdRadius,
+                        VisibleIndicesWriter  = visList.AsParallelWriter(),
+                    }.Schedule(slice.Count, batch, default);
+                }
+
+                JobHandle matricesH;
+                using (MatricesMarker.Auto())
+                {
+                    var matricesJob = new BuildMatricesJob
+                    {
+                        VisibleIndices  = visList.AsDeferredJobArray(),
+                        Positions       = Positions,
+                        Velocities      = Velocities,
+                        VisibleMatrices = visibleMatricesPerFlock[f],
+                    };
+                    // IJobParallelForDefer.Schedule resolves the iteration count from
+                    // visList's length at job-start time — no need to Complete cullH.
+                    matricesH = matricesJob.Schedule(visList, batch,
+                        JobHandle.CombineDependencies(cullH, integrateH));
+                }
+
+                combinedH = JobHandle.CombineDependencies(combinedH, matricesH);
             }
+
+            return combinedH;
         }
 
-        private void DispatchRendering()
+        private void DispatchRendering(Camera cam)
         {
-            Camera cam = Camera.main;
             for (int f = 0; f < registered.Count; f++)
             {
                 FlockManager mgr = registered[f];
@@ -581,14 +687,47 @@ namespace Bird_behiviour.Flocking.Simulation
                 }
 
                 FlockSlice slice = Slices[f];
-                NativeArray<float4x4>.ReadOnly readOnlyMatrices = Matrices.AsReadOnly();
+                if (slice.Count == 0) continue;
 
-                // Slice 2: pass the full Matrices array but tell the renderer to start at
-                // slice.StartIndex by giving it a sub-slice. NativeArray<T>.GetSubArray is
-                // safe and free.
-                NativeArray<float4x4> sub = Matrices.GetSubArray(slice.StartIndex, slice.Count);
-                renderer.Render(slice, s.BirdMesh, s.BirdMaterial, sub.AsReadOnly(), slice.Count, cam);
+                int visibleCount = visibleIndicesPerFlock[f].Length;
+                if (visibleCount <= 0) continue;
+
+                renderer.Render(
+                    slice,
+                    s.BirdMesh,
+                    s.BirdMaterial,
+                    visibleMatricesPerFlock[f].AsReadOnly(),
+                    visibleCount,
+                    cam);
             }
+        }
+
+        // ── Test-only accessor for visible-bird counts after a Tick (Slice 8 / M4) ──
+        /// <summary>
+        /// Returns the count of birds in flock <paramref name="flockId"/> that survived
+        /// frustum culling on the most recent <see cref="Tick"/>. Returns 0 if the flock
+        /// id is out of range or no Tick has run yet. PlayMode-test only.
+        /// </summary>
+        public int GetVisibleCountForTest(int flockId)
+        {
+            if (flockId < 0 || flockId >= visibleIndicesPerFlock.Length) return 0;
+            NativeList<int> list = visibleIndicesPerFlock[flockId];
+            return list.IsCreated ? list.Length : 0;
+        }
+
+        /// <summary>
+        /// Returns a copy of the global bird indices visible for flock <paramref name="flockId"/>
+        /// after the most recent <see cref="Tick"/>. Caller owns the returned array. PlayMode-test only.
+        /// </summary>
+        public int[] GetVisibleIndicesSnapshotForTest(int flockId)
+        {
+            if (flockId < 0 || flockId >= visibleIndicesPerFlock.Length) return System.Array.Empty<int>();
+            NativeList<int> list = visibleIndicesPerFlock[flockId];
+            if (!list.IsCreated || list.Length == 0) return System.Array.Empty<int>();
+            int n = list.Length;
+            int[] copy = new int[n];
+            for (int i = 0; i < n; i++) copy[i] = list[i];
+            return copy;
         }
 
         // ── Gizmos ────────────────────────────────────────────────────────────────────
