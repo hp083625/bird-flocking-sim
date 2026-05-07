@@ -4,7 +4,8 @@
     "references": [
         "Bird_behiviour.Flocking.Core",
         "Bird_behiviour.Flocking.Simulation",
-        "Bird_behiviour.Flocking.Tooling"
+        "Bird_behiviour.Flocking.Tooling",
+        "Bird_behiviour.Flocking.Rendering"
     ],
     "includePlatforms": [
         "Editor"
