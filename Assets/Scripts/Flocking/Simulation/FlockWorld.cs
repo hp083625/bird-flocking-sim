@@ -53,6 +53,17 @@ namespace Bird_behiviour.Flocking.Simulation
         [Tooltip("Time-scale multiplier on the simulation. 1 = real-time.")]
         [SerializeField, Min(0f)] private float simSpeedMultiplier = 1f;
 
+        [Header("Population")]
+        [Tooltip("Scales every registered flock's BirdCount by this factor at allocation time. 1 = whatever the FlockSettings asset says. Structural — change requires Apply (Restart Sim).")]
+        [SerializeField, Range(0.01f, 200f)] private float birdCountMultiplier = 1f;
+
+        /// <summary>Multiplier applied to every flock's <see cref="Core.IFlockSettings.BirdCount"/> at allocation time.</summary>
+        public float BirdCountMultiplier
+        {
+            get => birdCountMultiplier;
+            set => birdCountMultiplier = math.max(0.01f, value);
+        }
+
         [Header("Job Graph")]
         [Tooltip("IJobParallelFor inner-loop batch size. ~64-128 generally maximises worker-thread utilisation; larger reduces scheduling overhead, smaller improves load-balancing.")]
         [SerializeField, Min(1)] private int steeringBatchSize = 64;
@@ -109,6 +120,13 @@ namespace Bird_behiviour.Flocking.Simulation
 
         /// <summary>Registered flock count (0 ≤ count ≤ 256).</summary>
         public int RegisteredFlockCount => registered.Count;
+
+        /// <summary>Returns the settings of the registered flock at <paramref name="flockId"/>, or null if out of range. Used by the editor to preview Apply effects.</summary>
+        public IFlockSettings GetSettingsForFlockId(int flockId)
+        {
+            if (flockId < 0 || flockId >= registered.Count) return null;
+            return registered[flockId].Settings;
+        }
 
         // ── Per-bird arrays (Allocator.Persistent; sized to TotalBirdCount) ──────────
 
@@ -244,14 +262,27 @@ namespace Bird_behiviour.Flocking.Simulation
 
         // ── Allocation ────────────────────────────────────────────────────────────────
 
+        // Round-to-nearest int, clamped to non-negative. Used so birdCountMultiplier=1
+        // exactly reproduces the asset's BirdCount (no truncation drift).
+        private static int ScaleCount(int raw, float mult)
+        {
+            if (raw <= 0) return 0;
+            return math.max(0, (int)math.round(raw * mult));
+        }
+
         private void ReallocateForCurrentRegistration()
         {
             DisposeArrays();
 
+            // Snap the multiplier sensibly: never below 0.01, and apply it as
+            // round-half-to-even so multiplier=1 reproduces the asset's exact count.
+            float mult = math.max(0.01f, birdCountMultiplier);
+
             int total = 0;
             for (int i = 0; i < registered.Count; i++)
             {
-                total += math.max(0, registered[i].Settings.BirdCount);
+                int raw = math.max(0, registered[i].Settings.BirdCount);
+                total += ScaleCount(raw, mult);
             }
             TotalBirdCount = total;
 
@@ -266,7 +297,8 @@ namespace Bird_behiviour.Flocking.Simulation
             int cursor = 0;
             for (int i = 0; i < registered.Count; i++)
             {
-                int count = math.max(0, registered[i].Settings.BirdCount);
+                int raw = math.max(0, registered[i].Settings.BirdCount);
+                int count = ScaleCount(raw, mult);
                 Slices[i] = new FlockSlice(cursor, count, (byte)i);
                 cursor += count;
             }

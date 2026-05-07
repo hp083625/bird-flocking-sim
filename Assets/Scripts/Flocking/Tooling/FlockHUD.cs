@@ -197,7 +197,8 @@ namespace Bird_behiviour.Flocking.Tooling
             // Total + per-flock counts.
             int flockCount = world.RegisteredFlockCount;
             sb.Append("Birds: ").Append(world.TotalBirdCount)
-              .Append("   flocks: ").Append(flockCount).Append('\n');
+              .Append("   flocks: ").Append(flockCount)
+              .Append("   ×").Append(world.BirdCountMultiplier.ToString("0.##")).Append('\n');
 
             // Slices is only allocated after the first RegisterFlock call. Guard so the
             // HUD doesn't throw on the bootstrap frame before any manager has registered.

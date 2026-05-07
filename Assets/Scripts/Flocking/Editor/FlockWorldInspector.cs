@@ -4,6 +4,7 @@
 // bird count, registered flock count, and current spatial cell size; "Restart Sim"
 // button at the bottom. See FLOCKING_PLAN.md §6 M5-3.
 
+using Bird_behiviour.Flocking.Core;
 using Bird_behiviour.Flocking.Simulation;
 using UnityEditor;
 using UnityEngine;
@@ -28,30 +29,34 @@ namespace Bird_behiviour.Flocking.Editor
     public sealed class FlockWorldInspector : UnityEditor.Editor
     {
         // Field paths (must match the private field names in FlockWorld).
-        private const string PathBoundsCenter      = "worldBoundsCenter";
-        private const string PathBoundsExtents     = "worldBoundsExtents";
-        private const string PathBoundsWeight      = "worldBoundsWeight";
-        private const string PathMaxSimDt          = "maxSimDt";
+        private const string PathBoundsCenter       = "worldBoundsCenter";
+        private const string PathBoundsExtents      = "worldBoundsExtents";
+        private const string PathBoundsWeight       = "worldBoundsWeight";
+        private const string PathMaxSimDt           = "maxSimDt";
         private const string PathSimSpeedMultiplier = "simSpeedMultiplier";
+        private const string PathBirdCountMultiplier = "birdCountMultiplier";
 
         private SerializedProperty boundsCenterProp;
         private SerializedProperty boundsExtentsProp;
         private SerializedProperty boundsWeightProp;
         private SerializedProperty maxSimDtProp;
         private SerializedProperty simSpeedProp;
+        private SerializedProperty birdCountMultiplierProp;
 
         // Snapshot of the bounds values at last Apply — used to detect "differs from applied".
         private Vector3 appliedBoundsCenter;
         private Vector3 appliedBoundsExtents;
         private float appliedBoundsWeight;
+        private float appliedBirdCountMultiplier;
 
         private void OnEnable()
         {
-            boundsCenterProp   = serializedObject.FindProperty(PathBoundsCenter);
-            boundsExtentsProp  = serializedObject.FindProperty(PathBoundsExtents);
-            boundsWeightProp   = serializedObject.FindProperty(PathBoundsWeight);
-            maxSimDtProp       = serializedObject.FindProperty(PathMaxSimDt);
-            simSpeedProp       = serializedObject.FindProperty(PathSimSpeedMultiplier);
+            boundsCenterProp        = serializedObject.FindProperty(PathBoundsCenter);
+            boundsExtentsProp       = serializedObject.FindProperty(PathBoundsExtents);
+            boundsWeightProp        = serializedObject.FindProperty(PathBoundsWeight);
+            maxSimDtProp            = serializedObject.FindProperty(PathMaxSimDt);
+            simSpeedProp            = serializedObject.FindProperty(PathSimSpeedMultiplier);
+            birdCountMultiplierProp = serializedObject.FindProperty(PathBirdCountMultiplier);
 
             // Initial applied snapshot = whatever's already on the asset/component.
             CaptureAppliedSnapshot();
@@ -72,6 +77,49 @@ namespace Bird_behiviour.Flocking.Editor
                 new GUIContent("Sim Speed Multiplier", "1 = real-time, 0 = paused."),
                 simSpeedProp.floatValue, 0f, 4f);
             EditorGUI.indentLevel--;
+
+            EditorGUILayout.Space(8f);
+
+            // ── Population multiplier (structural — Apply to commit) ────────────────
+            EditorGUILayout.LabelField("Population (Apply to commit)", EditorStyles.boldLabel);
+            EditorGUI.indentLevel++;
+            EditorGUILayout.PropertyField(birdCountMultiplierProp,
+                new GUIContent("Bird Count Multiplier",
+                    "Scales every flock's BirdCount at allocation time. 1 = whatever the FlockSettings asset says."));
+
+            // Live preview of total bird count after applying the pending multiplier.
+            float pendingMult = birdCountMultiplierProp.floatValue;
+            int previewTotal = 0;
+            for (int i = 0; i < world.RegisteredFlockCount; i++)
+            {
+                var settings = world.GetSettingsForFlockId(i);
+                if (settings != null) previewTotal += Mathf.Max(0, Mathf.RoundToInt(settings.BirdCount * pendingMult));
+            }
+            EditorGUILayout.LabelField(
+                "Preview Total (× multiplier)",
+                $"{previewTotal:N0}  (current live: {world.TotalBirdCount:N0})");
+
+            bool multiplierDiffers = !Mathf.Approximately(pendingMult, appliedBirdCountMultiplier);
+            if (multiplierDiffers)
+            {
+                EditorGUILayout.HelpBox(
+                    "Pending multiplier change — press Apply to respawn all flocks at the new bird count.",
+                    MessageType.Info);
+            }
+            EditorGUI.indentLevel--;
+
+            EditorGUILayout.Space(2f);
+            using (new EditorGUI.DisabledScope(!multiplierDiffers))
+            {
+                if (GUILayout.Button("Apply Bird Count", GUILayout.Height(24f)))
+                {
+                    serializedObject.ApplyModifiedProperties();
+                    world.Rebuild();
+                    CaptureAppliedSnapshot();
+                    GUIUtility.ExitGUI();
+                    return;
+                }
+            }
 
             EditorGUILayout.Space(8f);
 
@@ -140,9 +188,10 @@ namespace Bird_behiviour.Flocking.Editor
 
         private void CaptureAppliedSnapshot()
         {
-            appliedBoundsCenter  = boundsCenterProp.vector3Value;
-            appliedBoundsExtents = boundsExtentsProp.vector3Value;
-            appliedBoundsWeight  = boundsWeightProp.floatValue;
+            appliedBoundsCenter        = boundsCenterProp.vector3Value;
+            appliedBoundsExtents       = boundsExtentsProp.vector3Value;
+            appliedBoundsWeight        = boundsWeightProp.floatValue;
+            appliedBirdCountMultiplier = birdCountMultiplierProp != null ? birdCountMultiplierProp.floatValue : 1f;
         }
 
         private static string DescribeCellSize(FlockWorld world)
