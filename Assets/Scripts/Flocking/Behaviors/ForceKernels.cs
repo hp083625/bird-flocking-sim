@@ -28,11 +28,20 @@ namespace Bird_behiviour.Flocking.Behaviors
     /// No managed allocations; no NativeArray accesses (those happen in the calling
     /// job, which then feeds primitives into the kernels).
     /// </remarks>
-    // Note: NO [BurstCompile] on the class or methods — that would mark these as
-    // "external functions" callable from Burst jobs, which forbids passing/returning
-    // structs by value (`float3` etc.). Instead we use [MethodImpl(AggressiveInlining)]
-    // so Burst inlines the entire body into whichever job calls them. Same perf,
-    // works with the natural signatures.
+    // ABI note (Burst restore): float3 / vector struct PARAMETERS are taken by `in`
+    // (pass-by-readonly-ref) instead of by value. Without this, Burst rejects the
+    // calling convention with BC1064/BC1067 ("vector type X cannot be passed by
+    // value as a parameter to an external function") whenever the inliner declines
+    // to fully inline a kernel into its caller. Returning a float3 by value is
+    // fine — Burst's return register convention handles it.
+    //
+    // Tests and job hot loops continue to call the kernels with the same syntax —
+    // C# 7.2+ implicitly synthesises a readonly reference for rvalue arguments
+    // ("ForceKernels.ComputeSeparation(selfPos, nPos, ...)" still works).
+    //
+    // [MethodImpl(AggressiveInlining)] is kept as a hint to the IL inliner so the
+    // C# compiler folds the bodies in where it can; Burst then has a stable
+    // pointer-passing ABI for the cases where it doesn't.
     internal static class ForceKernels
     {
         // ── Tunable epsilons (kept as constants so Burst can fold them) ──────────────
@@ -62,8 +71,8 @@ namespace Bird_behiviour.Flocking.Behaviors
         /// </remarks>
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
         internal static float3 ComputeSeparation(
-            float3 selfPos,
-            float3 neighborPos,
+            in float3 selfPos,
+            in float3 neighborPos,
             float separationRadius,
             float weight)
         {
@@ -109,8 +118,8 @@ namespace Bird_behiviour.Flocking.Behaviors
         /// <param name="weight">Weight applied to the steering delta.</param>
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
         internal static float3 ComputeAlignment(
-            float3 selfVel,
-            float3 neighborVelocitySum,
+            in float3 selfVel,
+            in float3 neighborVelocitySum,
             int neighborCount,
             float maxSpeed,
             float weight)
@@ -144,8 +153,8 @@ namespace Bird_behiviour.Flocking.Behaviors
         /// <param name="weight">Weight applied to the offset toward the centroid.</param>
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
         internal static float3 ComputeCohesion(
-            float3 selfPos,
-            float3 neighborPositionSum,
+            in float3 selfPos,
+            in float3 neighborPositionSum,
             int neighborCount,
             float weight)
         {
@@ -187,9 +196,9 @@ namespace Bird_behiviour.Flocking.Behaviors
         /// </remarks>
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
         internal static float3 ComputeBoundsForceWorldHard(
-            float3 selfPos,
-            float3 worldBoundsCenter,
-            float3 worldBoundsExtents,
+            in float3 selfPos,
+            in float3 worldBoundsCenter,
+            in float3 worldBoundsExtents,
             float weight,
             float margin)
         {
@@ -217,9 +226,9 @@ namespace Bird_behiviour.Flocking.Behaviors
         /// </remarks>
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
         internal static float3 ComputeBoundsForcePreferred(
-            float3 selfPos,
-            float3 preferredCenter,
-            float3 preferredExtents,
+            in float3 selfPos,
+            in float3 preferredCenter,
+            in float3 preferredExtents,
             float weight)
         {
             float maxExtent = math.max(math.cmax(preferredExtents), 1e-3f);
@@ -255,8 +264,8 @@ namespace Bird_behiviour.Flocking.Behaviors
         /// </remarks>
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
         internal static float3 ComputeCursorForce(
-            float3 selfPos,
-            float3 cursorWorldPoint,
+            in float3 selfPos,
+            in float3 cursorWorldPoint,
             bool cursorOnScreen,
             float strength,
             float radius)
@@ -302,9 +311,9 @@ namespace Bird_behiviour.Flocking.Behaviors
         /// </remarks>
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
         internal static bool PerceptionConeAccepts(
-            float3 selfPos,
-            float3 selfVel,
-            float3 neighborPos,
+            in float3 selfPos,
+            in float3 selfVel,
+            in float3 neighborPos,
             float coneCosHalfAngle)
         {
             float speedSq = math.lengthsq(selfVel);

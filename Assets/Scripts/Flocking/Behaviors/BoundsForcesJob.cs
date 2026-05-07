@@ -19,7 +19,7 @@ namespace Bird_behiviour.Flocking.Behaviors
     /// Independent of the spatial grid — runs in parallel with
     /// <c>NeighborForcesJob</c> + <c>CursorForceJob</c> per the FLOCKING_PLAN.md §2 graph.
     /// </remarks>
-    // [BurstCompile] // disabled by lead — Burst rejects float3-by-value in external-function ABI; revisit by refactoring ForceKernels to in/out signatures
+    [BurstCompile(CompileSynchronously = true)]
     internal struct BoundsForcesJob : IJobParallelFor
     {
         [ReadOnly] public NativeArray<float3> Positions;
