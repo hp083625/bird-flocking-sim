@@ -15,7 +15,7 @@ MonoBehaviour:
   inSeparationWeight: 1
   inAlignmentWeight: 1
   inCohesionWeight: 1
-  outSeparationWeight: 1
+  outSeparationWeight: 5
   outAlignmentWeight: 0
   outCohesionWeight: 0
   preferredCenter: {x: 0, y: 0, z: 0}
@@ -29,7 +29,7 @@ MonoBehaviour:
   maxAcceleration: 30
   cursorReactionStrength: -3
   cursorReactionRadius: 10
-  birdCount: 100
+  birdCount: 200
   birdMesh: {fileID: 4300000, guid: 750a2c182d36147379c2568ef21c867c, type: 2}
   birdMaterial: {fileID: 2100000, guid: a36e4d1241dbe4cf8af10c1f9bdf2039, type: 2}
   randomSeed: 0
