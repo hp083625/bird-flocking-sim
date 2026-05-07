@@ -5,10 +5,13 @@
 // O(n²) loop. Slice 4 (M3) will jobify + Burst-compile the steering itself.
 
 using System.Collections.Generic;
+using Bird_behiviour.Flocking.Behaviors;
 using Bird_behiviour.Flocking.Core;
 using Bird_behiviour.Flocking.Spatial;
 using Unity.Collections;
+using Unity.Jobs;
 using Unity.Mathematics;
+using Unity.Profiling;
 using UnityEngine;
 
 namespace Bird_behiviour.Flocking.Simulation
@@ -48,6 +51,16 @@ namespace Bird_behiviour.Flocking.Simulation
         [SerializeField, Min(1f / 240f)] private float maxSimDt = 1f / 30f;
         [Tooltip("Time-scale multiplier on the simulation. 1 = real-time.")]
         [SerializeField, Min(0f)] private float simSpeedMultiplier = 1f;
+
+        [Header("Job Graph")]
+        [Tooltip("IJobParallelFor inner-loop batch size. ~64-128 generally maximises worker-thread utilisation; larger reduces scheduling overhead, smaller improves load-balancing.")]
+        [SerializeField, Min(1)] private int steeringBatchSize = 64;
+
+        /// <summary>Inner-loop batch size used when scheduling steering IJobParallelFors (Slice 4 / M3).</summary>
+        internal int SteeringBatchSize => steeringBatchSize;
+
+        // ── Profiler markers (Slice 4 / M3 — read by M5 HUD + Unity Profiler) ─────────
+        private static readonly ProfilerMarker BuildGridMarker = new ProfilerMarker("Flock.BuildGrid");
 
         /// <inheritdoc/>
         public float3 WorldBoundsCenter   => worldBoundsCenter;
@@ -367,38 +380,71 @@ namespace Bird_behiviour.Flocking.Simulation
                 return;
             }
 
-            // 1. Build the cell-list spatial grid for this frame's positions. We schedule
-            //    + immediately Complete so the rest of Tick stays main-thread (Slice 3
-            //    doesn't jobify steering; that's Slice 4's work). With the grid in place
-            //    the neighbour scan drops from O(n²) to O(n · avg_cell_occupancy).
+            // ── 1. Schedule the cell-list spatial grid build (Slice 3 / M2). ──────────
+            //
+            // We DO NOT immediately Complete the build here any more — Slice 4 (M3)
+            // chains NeighborForcesJob off this handle so the grid build runs on a
+            // worker thread in parallel with BoundsForcesJob + CursorForceJob. The
+            // whole chain is completed by IntegrateJob below.
+            JobHandle gridHandle = default;
             SpatialIndexReadOnly spatial = default;
             if (spatialIndex != null && spatialIndex.IsAllocated)
             {
-                Unity.Jobs.JobHandle build = spatialIndex.ScheduleBuild(
-                    Positions.AsReadOnly(), TotalBirdCount, default);
-                build.Complete();
+                using (BuildGridMarker.Auto())
+                {
+                    gridHandle = spatialIndex.ScheduleBuild(
+                        Positions.AsReadOnly(), TotalBirdCount, default);
+                }
                 spatial = spatialIndex.AsReadOnly();
             }
 
-            // 2. Compute accelerations using the spatial grid for the neighbour scan.
-            //    (Slice 4 will replace this with a [BurstCompile] IJobParallelFor that
-            //    consumes the same SpatialIndexReadOnly view.)
-            NaiveSteering.ComputeAccelerations(
-                Positions, Velocities, FlockIds, Slices, TotalBirdCount,
-                settingsByFlockId, this,
-                CursorWorldPoint, CursorOnScreen,
-                spatial,
-                Accelerations);
+            // ── 2. Allocate per-frame intermediate buffers (TempJob, frame-scoped) ─
+            //
+            // These are unmanaged NativeArrays (Profiler.GetMonoUsedSizeLong is flat)
+            // and disposed right after IntegrateJob.Complete() below.
+            var accelNeighbor = new NativeArray<float3>(TotalBirdCount, Allocator.TempJob, NativeArrayOptions.UninitializedMemory);
+            var accelBounds   = new NativeArray<float3>(TotalBirdCount, Allocator.TempJob, NativeArrayOptions.UninitializedMemory);
+            var accelCursor   = new NativeArray<float3>(TotalBirdCount, Allocator.TempJob, NativeArrayOptions.UninitializedMemory);
+            var kernelSettings = SteeringJobGraph.BuildKernelSettings(settingsByFlockId, Allocator.TempJob);
 
-            // 3. Integrate.
-            NaiveSteering.Integrate(
-                Positions, Velocities, FlockIds, Accelerations, TotalBirdCount,
-                settingsByFlockId, dt);
+            // World-bounds margin: 5% of the smaller extent (per FLOCKING_PLAN.md §6 M3-2).
+            float worldMargin = math.cmin(WorldBoundsExtents) * 0.05f;
 
-            // 4. Build world matrices (translation + look-along-velocity).
+            var spec = new SteeringJobGraph.DispatchSpec
+            {
+                Positions          = Positions,
+                Velocities         = Velocities,
+                Accelerations      = Accelerations,
+                FlockIds           = FlockIds,
+                AccelNeighbor      = accelNeighbor,
+                AccelBounds        = accelBounds,
+                AccelCursor        = accelCursor,
+                KernelSettings     = kernelSettings,
+                Spatial            = spatial,
+                WorldBoundsCenter  = WorldBoundsCenter,
+                WorldBoundsExtents = WorldBoundsExtents,
+                WorldBoundsWeight  = WorldBoundsWeight,
+                WorldBoundsMargin  = worldMargin,
+                BirdCount          = TotalBirdCount,
+                BatchSize          = SteeringBatchSize,
+                Dt                 = dt,
+                GridHandle         = gridHandle,
+            };
+
+            // ── 3. Schedule the parallel job graph + complete on the main thread ────
+            JobHandle integrateH = SteeringJobGraph.Dispatch(in spec);
+            integrateH.Complete();
+
+            // Dispose per-frame TempJob buffers now that IntegrateJob has consumed them.
+            accelNeighbor.Dispose();
+            accelBounds.Dispose();
+            accelCursor.Dispose();
+            kernelSettings.Dispose();
+
+            // ── 4. Build world matrices (translation + look-along-velocity). ─────────
             BuildMatrices();
 
-            // 5. Dispatch per-flock rendering.
+            // ── 5. Dispatch per-flock rendering. ────────────────────────────────────
             DispatchRendering();
         }
 

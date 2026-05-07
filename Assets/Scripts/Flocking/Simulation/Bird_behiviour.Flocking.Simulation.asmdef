@@ -5,6 +5,7 @@
         "Bird_behiviour.Flocking.Core",
         "Bird_behiviour.Flocking.Rendering",
         "Bird_behiviour.Flocking.Spatial",
+        "Bird_behiviour.Flocking.Behaviors",
         "Unity.Burst",
         "Unity.Collections",
         "Unity.Mathematics"
