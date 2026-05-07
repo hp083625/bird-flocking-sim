@@ -4,6 +4,7 @@
     "references": [
         "Bird_behiviour.Flocking.Core",
         "Bird_behiviour.Flocking.Simulation",
+        "Unity.InputSystem",
         "Unity.Mathematics"
     ],
     "includePlatforms": [],
