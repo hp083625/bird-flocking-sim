@@ -59,8 +59,18 @@ namespace Bird_behiviour.Flocking.Simulation
         /// <summary>Inner-loop batch size used when scheduling steering IJobParallelFors (Slice 4 / M3).</summary>
         internal int SteeringBatchSize => steeringBatchSize;
 
+        [Header("Rendering")]
+        [Tooltip("Per-bird sphere radius used by FrustumCullJob to pad the 6 frustum-plane tests so birds don't pop in/out at the edge. ~2× visual bird size is a safe default.")]
+        [SerializeField, Min(0f)] private float birdCullRadius = 0.5f;
+
+        /// <summary>Per-bird padding radius (world units) used by <see cref="Bird_behiviour.Flocking.Rendering.FrustumCullJob"/>.</summary>
+        public float BirdCullRadius => birdCullRadius;
+
         // ── Profiler markers (Slice 4 / M3 — read by M5 HUD + Unity Profiler) ─────────
         private static readonly ProfilerMarker BuildGridMarker = new ProfilerMarker("Flock.BuildGrid");
+        // Slice 8 / M4 — cull + matrices job markers (per FLOCKING_PLAN §6 M5-5 names).
+        private static readonly ProfilerMarker CullMarker      = new ProfilerMarker("Flock.Cull");
+        private static readonly ProfilerMarker MatricesMarker  = new ProfilerMarker("Flock.Matrices");
 
         /// <inheritdoc/>
         public float3 WorldBoundsCenter   => worldBoundsCenter;
@@ -118,6 +128,32 @@ namespace Bird_behiviour.Flocking.Simulation
         public int TotalBirdCount { get; private set; }
 
         private bool arraysAllocated;
+
+        // ── Camera frustum cache (Slice 8 / M4) ──────────────────────────────────────
+        //
+        // 6 planes encoded as float4 (xyz = inward-facing normal, w = signed distance);
+        // a point p is inside the frustum iff dot(plane.xyz, p) + plane.w >= 0 for every
+        // plane. We allocate Persistent + length 6 once in Awake (re-used every frame),
+        // and refresh from Camera.main inside Tick. Tests can override via
+        // <see cref="SetCameraFrustumPlanesForTest"/> which writes the array directly.
+        //
+        // Default (zero-initialised) state means EVERY plane test passes — i.e. no
+        // culling — so a missing camera or pre-Awake state degrades gracefully to "render
+        // all birds" rather than to a black screen.
+        private NativeArray<float4> cameraFrustumPlanes;
+
+        // Reusable Plane[6] scratch for GeometryUtility.CalculateFrustumPlanes(camera, planes).
+        // The overload that takes a Plane[] avoids the per-call allocation that the
+        // returning-Plane[] overload would otherwise incur.
+        private readonly UnityEngine.Plane[] frustumPlaneScratch = new UnityEngine.Plane[6];
+
+        // When true (set by <see cref="SetCameraFrustumPlanesForTest"/>), Tick skips the
+        // Camera.main lookup + plane recompute — tests own the cache for the rest of the
+        // run. Cleared by <see cref="ClearCameraFrustumPlanesOverride"/>.
+        private bool frustumPlanesOverridden;
+
+        /// <summary>Read-only view of the cached 6 camera frustum planes (xyz = inward normal, w = distance).</summary>
+        public NativeArray<float4>.ReadOnly CameraFrustumPlanes => cameraFrustumPlanes.AsReadOnly();
 
         // ── Spatial index (Slice 3 / M2) ─────────────────────────────────────────────
 
@@ -347,10 +383,80 @@ namespace Bird_behiviour.Flocking.Simulation
 
         // ── Unity lifecycle ──────────────────────────────────────────────────────────
 
+        private void Awake()
+        {
+            // Allocate the 6-plane frustum cache once per FlockWorld lifetime so Tick is
+            // alloc-free. Default contents are zero → every plane test passes (visible),
+            // which is the desired fail-safe (no Camera.main yet → no culling).
+            if (!cameraFrustumPlanes.IsCreated)
+            {
+                cameraFrustumPlanes = new NativeArray<float4>(6, Allocator.Persistent, NativeArrayOptions.ClearMemory);
+            }
+        }
+
         private void OnDestroy()
         {
             DisposeArrays();
             DisposeSpatialIndex();
+            if (cameraFrustumPlanes.IsCreated)
+            {
+                cameraFrustumPlanes.Dispose();
+            }
+        }
+
+        /// <summary>
+        /// Refreshes <see cref="CameraFrustumPlanes"/> from the supplied camera. Called from
+        /// <see cref="Tick"/> with <see cref="Camera.main"/> in production; tests use
+        /// <see cref="SetCameraFrustumPlanesForTest"/> instead.
+        /// </summary>
+        /// <remarks>
+        /// Uses the <c>GeometryUtility.CalculateFrustumPlanes(Camera, Plane[])</c> overload
+        /// that writes into a pre-allocated buffer to avoid the per-frame managed alloc the
+        /// returning-Plane[] overload would otherwise incur.
+        /// <para/>
+        /// GeometryUtility's planes have <em>inward-facing</em> normals, so a point <c>p</c>
+        /// is inside the frustum iff <c>dot(n, p) + d &gt;= 0</c> for every plane — which is
+        /// exactly what <c>FrustumCullJob</c> assumes.
+        /// </remarks>
+        private void UpdateCameraFrustumPlanesFrom(Camera cam)
+        {
+            if (cam == null || !cameraFrustumPlanes.IsCreated)
+            {
+                return;
+            }
+            GeometryUtility.CalculateFrustumPlanes(cam, frustumPlaneScratch);
+            for (int i = 0; i < 6; i++)
+            {
+                UnityEngine.Plane p = frustumPlaneScratch[i];
+                cameraFrustumPlanes[i] = new float4(p.normal.x, p.normal.y, p.normal.z, p.distance);
+            }
+        }
+
+        /// <summary>
+        /// Test hook: writes the 6 frustum planes directly into the cache and pins them so
+        /// subsequent <see cref="Tick"/> calls do <em>not</em> overwrite them from
+        /// <see cref="Camera.main"/>. Intended for headless PlayMode tests that don't want
+        /// to set up a real <c>MainCamera</c>.
+        /// </summary>
+        /// <param name="planes">Source array of length 6 (xyz = inward normal, w = distance).</param>
+        public void SetCameraFrustumPlanesForTest(NativeArray<float4> planes)
+        {
+            if (!cameraFrustumPlanes.IsCreated)
+            {
+                cameraFrustumPlanes = new NativeArray<float4>(6, Allocator.Persistent, NativeArrayOptions.ClearMemory);
+            }
+            int n = math.min(6, planes.Length);
+            for (int i = 0; i < n; i++)
+            {
+                cameraFrustumPlanes[i] = planes[i];
+            }
+            frustumPlanesOverridden = true;
+        }
+
+        /// <summary>Clears the test-only override set by <see cref="SetCameraFrustumPlanesForTest"/>; subsequent ticks resume reading from <see cref="Camera.main"/>.</summary>
+        public void ClearCameraFrustumPlanesOverride()
+        {
+            frustumPlanesOverridden = false;
         }
 
         private void LateUpdate()
