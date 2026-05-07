@@ -142,6 +142,62 @@ namespace Bird_behiviour.Flocking.Simulation
         }
 
         /// <summary>
+        /// Tears down this flock's renderer + slice and re-registers it from scratch with
+        /// the current <see cref="Settings"/>. Birds are re-spawned using
+        /// <see cref="IFlockSettings.RandomSeed"/>.
+        /// </summary>
+        /// <remarks>
+        /// Called by Slice 10's "Apply Structural Changes" button after a structural field
+        /// (BirdCount / PerceptionRadius / SeparationRadius) has been committed to the
+        /// settings asset. Safe to call from EditMode (when the simulation isn't ticking)
+        /// and from PlayMode. No-op if the manager isn't currently active or has no world.
+        /// <para/>
+        /// <b>Allocation contract.</b> The only managed allocations occur inside
+        /// <see cref="FlockWorld.RegisterFlock"/>'s reallocation pass and the renderer's
+        /// constructor — there is no per-Rebuild garbage on top of that, per
+        /// <c>FLOCKING_PLAN.md §6 M1-6</c>.
+        /// </remarks>
+        public void Rebuild()
+        {
+            if (!isActiveAndEnabled)
+            {
+                return;
+            }
+            if (world == null)
+            {
+                Debug.LogWarning(
+                    $"[FlockManager:{name}] Rebuild() called with no FlockWorld bound; skipping.",
+                    this);
+                return;
+            }
+            if (Settings == null)
+            {
+                Debug.LogWarning(
+                    $"[FlockManager:{name}] Rebuild() called with no settings; skipping.",
+                    this);
+                return;
+            }
+
+            // Tear down current registration + renderer.
+            if (registered)
+            {
+                world.DeregisterFlock(this);
+                registered = false;
+            }
+            if (Renderer != null)
+            {
+                Renderer.Dispose();
+                Renderer = null;
+            }
+
+            // Re-register from scratch — RegisterFlock triggers OnSliceAllocated → SpawnIntoSlice
+            // which honours the current RandomSeed.
+            Renderer = new InstancedFlockRenderer();
+            Slice = world.RegisterFlock(this);
+            registered = true;
+        }
+
+        /// <summary>
         /// Called by <see cref="FlockWorld"/> after it has (re-)allocated its per-bird arrays
         /// and assigned this manager its slice. Spawns BirdCount birds inside
         /// <c>PreferredCenter ± PreferredExtents</c> with random velocities in
