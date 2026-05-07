@@ -35,3 +35,25 @@ Do not edit files under `Library/`, `Temp/`, `Logs/`, or `UserSettings/` — the
 
 - The only existing scripts are `Assets/TutorialInfo/Scripts/Readme.cs` (a `ScriptableObject` for the Unity welcome screen) and its editor `ReadmeEditor.cs`. These are template boilerplate and safe to delete once real gameplay code is added.
 - Every asset in `Assets/` has a paired `.meta` file. When renaming/moving/deleting an asset via shell, move/delete the `.meta` alongside it; otherwise Unity will regenerate a new GUID and break references.
+
+## Source code layout
+
+All flocking-simulation code lives under `Assets/Scripts/Flocking/`, one folder per assembly definition. The dependency graph is enforced by the `.asmdef` files; see `docs/FLOCKING_PLAN.md` §3 for owners and §4 for the public contracts that flow through `Core`.
+
+| Folder | Assembly | One-line description |
+|---|---|---|
+| `Core/` | `Bird_behiviour.Flocking.Core` | M0 Foundation — public types/interfaces every other module talks through; no dependencies. |
+| `Simulation/` | `Bird_behiviour.Flocking.Simulation` | M1 — `FlockWorld`/`FlockManager` lifecycle, world-state arrays, per-frame job graph orchestration. |
+| `Spatial/` | `Bird_behiviour.Flocking.Spatial` | M2 — cell-list spatial hash grid (`BuildGridJob`, `NeighborEnumerator`). |
+| `Behaviors/` | `Bird_behiviour.Flocking.Behaviors` | M3 — Burst-compiled steering jobs (neighbor forces, bounds, cursor, integration). |
+| `Rendering/` | `Bird_behiviour.Flocking.Rendering` | M4 — per-flock GPU-instanced indirect rendering, frustum cull, matrix build. |
+| `Tooling/` | `Bird_behiviour.Flocking.Tooling` | M5 runtime — `FlockSettings` ScriptableObject, fly-cam, cursor controller, HUD. |
+| `Editor/` | `Bird_behiviour.Flocking.Editor` | M5 editor-only — custom inspectors, gizmo drawers (Editor platform only). |
+| `Tests.EditMode/` | `Bird_behiviour.Flocking.Tests.EditMode` | M6 — pure-math/property tests; runs in EditMode. Gated on `UNITY_INCLUDE_TESTS`. |
+| `Tests.PlayMode/` | `Bird_behiviour.Flocking.Tests.PlayMode` | M6 — integration/allocation tests; runs in PlayMode. Gated on `UNITY_INCLUDE_TESTS`. |
+
+Repo-root project conventions:
+
+- `.editorconfig` — 4-space C# indent (Allman braces), 2-space JSON/YAML/MD, LF, UTF-8, final newline, trim trailing whitespace.
+- `.unity-version` — pinned editor version (matches `ProjectSettings/ProjectVersion.txt`).
+- `docs/CODING_CONVENTIONS.md` — canonical coding rules (allocator hygiene, no LINQ in hot paths, math types, naming, branch naming). Mirrors `FLOCKING_PLAN.md` §8.
