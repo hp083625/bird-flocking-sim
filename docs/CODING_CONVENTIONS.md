@@ -17,3 +17,25 @@ Canonical source for the bird-flocking-sim codebase. Mirrors §8 of `FLOCKING_PL
 **Branch naming.** `feat/m{N}-{slug}` for module work, `fix/{slug}` for bugs, `chore/{slug}` for tooling, `docs/{slug}` for docs.
 
 **Burst safety check setting.** `Safety Checks` ON in Editor (catches bugs); OFF in Player builds (perf). This is Unity's default; do not change.
+
+---
+
+## Canonical predator/prey weights (Slice 6)
+
+Starting point for new predator/prey `FlockSettings` assets. Tuned so `PredatorPreyChaseTest` passes with margin and the sandbox demo reads visually as a hunt.
+
+| field                  | prey | predator |
+| ---                    | --- | --- |
+| InSeparationWeight     | 1   | 1.5 |
+| InAlignmentWeight      | 1   | 0.5 |
+| InCohesionWeight       | 1   | 0.5 |
+| OutSeparationWeight    | **5** | 0   |
+| OutAlignmentWeight     | 0   | 0   |
+| OutCohesionWeight      | 0   | **5** |
+| MaxSpeed               | 10  | **12** |
+| MaxAcceleration        | 30  | 35  |
+| PerceptionRadius       | 5   | **8** |
+| CursorReactionStrength | -3  | 0   |
+| BirdCount              | 200 | 30  |
+
+The asymmetry to remember: predators have `OutCohesionWeight > 0` (pull toward prey centroid inside their perception cone); prey have `OutSeparationWeight > 0` (push away from any other-flock neighbour). The other two cross-flock weights stay at zero so the relationship is binary and easy to reason about. Predators ignore the cursor so the player can't directly steer the hunt.
