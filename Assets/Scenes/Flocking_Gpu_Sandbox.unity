@@ -611,6 +611,47 @@ MonoBehaviour:
   m_Script: {fileID: 11500000, guid: 40f8ce7f59fc748c9a8bdd56e6b3d2df, type: 3}
   m_Name:
   m_EditorClassIdentifier:
+  flocks:
+  - name: Prey
+    birdCount: 18000
+    color: {r: 0.4, g: 0.7, b: 1, a: 1}
+    perceptionRadius: 5
+    separationRadius: 1.5
+    perceptionConeHalfAngleRadians: 2.356194
+    minSpeed: 1
+    maxSpeed: 10
+    maxAcceleration: 30
+    inSeparationWeight: 1.5
+    inAlignmentWeight: 1
+    inCohesionWeight: 1
+    outSeparationWeight: 5
+    outAlignmentWeight: 0
+    outCohesionWeight: 0
+    cursorReactionStrength: -3
+    cursorReactionRadius: 12
+    preferredCenter: {x: 0, y: 0, z: 0}
+    preferredExtents: {x: 25, y: 10, z: 25}
+    preferredAttractionWeight: 1
+  - name: Predator
+    birdCount: 2000
+    color: {r: 0.95, g: 0.1, b: 0.1, a: 1}
+    perceptionRadius: 8
+    separationRadius: 2
+    perceptionConeHalfAngleRadians: 2.356194
+    minSpeed: 1.5
+    maxSpeed: 12
+    maxAcceleration: 35
+    inSeparationWeight: 1.5
+    inAlignmentWeight: 0.5
+    inCohesionWeight: 0.5
+    outSeparationWeight: 0
+    outAlignmentWeight: 0
+    outCohesionWeight: 5
+    cursorReactionStrength: 0
+    cursorReactionRadius: 10
+    preferredCenter: {x: 0, y: 5, z: 0}
+    preferredExtents: {x: 20, y: 8, z: 20}
+    preferredAttractionWeight: 1
   birdCount: 20000
   randomSeed: 42
   worldBoundsCenter: {x: 0, y: 0, z: 0}
