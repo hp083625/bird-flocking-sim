@@ -5,7 +5,8 @@
     "Bird_behiviour.Flocking.Core",
     "Bird_behiviour.Flocking.Rendering",
     "Unity.Mathematics",
-    "Unity.Collections"
+    "Unity.Collections",
+    "Unity.InputSystem"
   ],
   "includePlatforms": [],
   "excludePlatforms": [],

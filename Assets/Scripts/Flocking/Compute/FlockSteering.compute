@@ -39,11 +39,27 @@ struct Boid
     float4 reserved;
 };
 
+// ── FlockKernelSettings struct (mirror of Compute/FlockSettingsGpu.cs) ────────
+// 96 bytes, 16-byte aligned. Indexed by Boid.flockId.
+struct FlockKernelSettings
+{
+    float3 color;                       float perceptionRadius;
+    float  separationRadius;            float perceptionConeCos;
+    float  minSpeed;                    float maxSpeed;
+    float  maxAcceleration;
+    float  inSepW;                      float inAliW;             float inCohW;
+    float  outSepW;                     float outAliW;            float outCohW;
+    float  cursorReactionStrength;
+    float  cursorReactionRadius;        float3 preferredCenter;
+    float  preferredAttractionWeight;   float3 preferredExtents;
+};
+
 // ── Buffers ────────────────────────────────────────────────────────────────────
-RWStructuredBuffer<Boid>     _Boids;            // R+W per tick
-RWStructuredBuffer<uint2>    _CellKeys;         // (cellId, boidId) — written by CSHash, sorted by BitonicSort.compute (P2)
-RWStructuredBuffer<uint>     _CellStart;        // cellStart[cellId] = first index in _CellKeys that has that cellId; 0xFFFFFFFF when empty
-RWStructuredBuffer<float4x4> _Matrices;         // written by CSBuildMatrices, consumed by RenderMeshIndirect
+RWStructuredBuffer<Boid>                _Boids;        // R+W per tick
+RWStructuredBuffer<uint2>               _CellKeys;     // (cellId, boidId) — written by CSHash, sorted by BitonicSort.compute (P2)
+RWStructuredBuffer<uint>                _CellStart;    // cellStart[cellId] = first index in _CellKeys that has that cellId; 0xFFFFFFFF when empty
+RWStructuredBuffer<float4x4>            _Matrices;     // written by CSBuildMatrices, consumed by RenderMeshIndirect
+StructuredBuffer<FlockKernelSettings>   _FlockSettings; // P3: indexed by Boid.flockId. Read-only per tick.
 
 // CellStart sentinel: any read >= _PaddedKeyCount means "no birds in that cell".
 // We use _PaddedKeyCount itself (not 0xFFFFFFFF) as the sentinel because the
@@ -63,7 +79,8 @@ float3 _WorldOrigin;     // bottom-back-left corner of the spatial grid
 float  _CellSize;        // cell edge length (= max perception radius across flocks)
 uint3  _GridDim;         // cells per axis
 
-// Single-flock steering params for P1 (replaced by FlockSettingsGpu buffer in P3).
+// Single-flock steering params kept for the legacy CSSteerBruteForce + CSSteerCellList
+// kernels (P1/P2 paths). CSSteerTopoK (P5+) reads from _FlockSettings instead.
 float _PerceptionRadius;
 float _SeparationRadius;
 float _MinSpeed;
@@ -72,11 +89,23 @@ float _MaxAcceleration;
 float _SepWeight;
 float _AliWeight;
 float _CohWeight;
-
-// Soft preferred-zone (for P3 we'll move this into FlockSettingsGpu).
 float3 _PreferredCenter;
 float3 _PreferredExtents;
 float  _PreferredAttractionWeight;
+
+// ── P3 world-scoped constants ───────────────────────────────────────────────
+// Hard world bounds (sharp inward push outside extents). Per-flock soft
+// "preferred zone" is in FlockKernelSettings; the world hard bounds is
+// global because every flock shares the same physical world container.
+float3 _WorldBoundsCenter;
+float3 _WorldBoundsExtents;
+float  _WorldBoundsWeight;
+float  _WorldBoundsMargin;
+
+// Cursor — world-space position of the player's pointer + a flag whether
+// the cursor was successfully projected onto the horizontal plane this tick.
+float3 _CursorWorldPoint;
+uint   _CursorOnScreen; // 0 or 1; bool-like for SetInt
 
 // ── Hash helpers ──────────────────────────────────────────────────────────────
 //
@@ -462,12 +491,17 @@ void CSSteerTopoK(uint3 tid : SV_DispatchThreadID)
     Boid me = _Boids[i];
     float3 selfPos = me.pos;
     float3 selfVel = me.vel;
+    uint   selfFlock = me.flockId;
+    FlockKernelSettings s = _FlockSettings[selfFlock];
 
     int3 myCell = WorldToCell(selfPos);
-    float perceptSq = _PerceptionRadius * _PerceptionRadius;
+    float perceptSq = s.perceptionRadius * s.perceptionRadius;
 
-    // K-NN state — register-resident. INVALID id sentinel = 0xFFFFFFFF.
-    // sqDist starts at +infinity so the first K candidates always insert.
+    // Pre-compute selfVel info for the perception cone test.
+    float speedSq = dot(selfVel, selfVel);
+    bool  hasHeading = (speedSq > 1e-8f);
+
+    // K-NN state — register-resident.
     const uint KMAX = 8;
     uint  knnIds[KMAX];
     float knnSqDist[KMAX];
@@ -477,7 +511,7 @@ void CSSteerTopoK(uint3 tid : SV_DispatchThreadID)
         knnSqDist[kk] = 1e30f;
     }
 
-    // 27-cell walk — record candidates into the K-NN array.
+    // 27-cell walk — gather K-NN candidates that pass the perception cone test.
     [unroll] for (int dz = -1; dz <= 1; ++dz)
     {
         [unroll] for (int dy = -1; dy <= 1; ++dy)
@@ -508,12 +542,19 @@ void CSSteerTopoK(uint3 tid : SV_DispatchThreadID)
                     float distSq = dot(toN, toN);
                     if (distSq > perceptSq || distSq <= 1e-12f) continue;
 
+                    // Perception cone test: dot(unit selfVel, unit toN) >= cosHalfAngle.
+                    // Skipped when bird is motionless (360° fallback).
+                    if (hasHeading)
+                    {
+                        float dotRaw = dot(selfVel, toN);
+                        float invLens = rsqrt(speedSq * distSq);
+                        float cosTheta = dotRaw * invLens;
+                        if (cosTheta < s.perceptionConeCos) continue;
+                    }
+
                     // Insert into K-NN if closer than the current K-th element.
                     if (distSq < knnSqDist[KMAX - 1u])
                     {
-                        // Bubble-shift larger elements right until we find the
-                        // insertion slot. Bounded by KMAX=8 iterations; HLSL
-                        // unrolls trivially.
                         uint pos = KMAX - 1u;
                         [unroll] for (uint shift = 0; shift < KMAX - 1u; ++shift)
                         {
@@ -538,92 +579,144 @@ void CSSteerTopoK(uint3 tid : SV_DispatchThreadID)
         }
     }
 
-    // Accumulate forces from the K nearest. Re-read positions/velocities (Apple
-    // GPU keeps them hot in L1 from the walk above so the cost is negligible).
-    float sepRSq = _SeparationRadius * _SeparationRadius;
-    float3 sepAccum = float3(0, 0, 0);
-    float3 aliSum   = float3(0, 0, 0);
-    float3 cohSum   = float3(0, 0, 0);
-    uint   nCount   = 0;
+    // Accumulate forces — split in/out of flock so the cross-flock weight branch
+    // happens once per K-NN slot (cheap), not per candidate (expensive).
+    float sepRSq = s.separationRadius * s.separationRadius;
 
-    [unroll] for (uint kk = 0; kk < KMAX; ++kk)
+    float3 sepIn  = float3(0, 0, 0);  float3 aliInS  = float3(0, 0, 0);  float3 cohInS  = float3(0, 0, 0);  uint countIn  = 0;
+    float3 sepOut = float3(0, 0, 0);  float3 aliOutS = float3(0, 0, 0);  float3 cohOutS = float3(0, 0, 0);  uint countOut = 0;
+
+    [unroll] for (uint kk2 = 0; kk2 < KMAX; ++kk2)
     {
-        if (knnIds[kk] == 0xFFFFFFFFu) break;
-        Boid nb = _Boids[knnIds[kk]];
-        float distSq = knnSqDist[kk];
+        if (knnIds[kk2] == 0xFFFFFFFFu) break;
+        Boid nb = _Boids[knnIds[kk2]];
+        float distSq = knnSqDist[kk2];
+        bool sameFlock = (nb.flockId == selfFlock);
 
+        // Per-pair separation contribution.
+        float3 sepContrib = float3(0, 0, 0);
         if (distSq < sepRSq)
         {
             float3 toN = nb.pos - selfPos;
             float invD = rsqrt(distSq);
             float dist = distSq * invD;
-            float fall = 1.0f - dist / _SeparationRadius;
-            sepAccum -= toN * (invD * fall);
+            float fall = 1.0f - dist / s.separationRadius;
+            sepContrib = -toN * (invD * fall);
         }
-        aliSum += nb.vel;
-        cohSum += nb.pos;
-        nCount++;
+
+        if (sameFlock)
+        {
+            sepIn  += sepContrib;
+            aliInS += nb.vel;
+            cohInS += nb.pos;
+            countIn++;
+        }
+        else
+        {
+            sepOut += sepContrib;
+            aliOutS += nb.vel;
+            cohOutS += nb.pos;
+            countOut++;
+        }
     }
 
-    // Reynolds alignment + cohesion.
+    // Reynolds alignment + cohesion folded through the in/out branch.
     float3 ali = float3(0, 0, 0);
     float3 coh = float3(0, 0, 0);
-    if (nCount > 0u)
+    if (countIn > 0u)
     {
-        float invN = 1.0f / (float)nCount;
-        float3 avgVel = aliSum * invN;
-        float avgVelSq = dot(avgVel, avgVel);
-        if (avgVelSq > 1e-12f)
-        {
-            float3 desired = avgVel * rsqrt(avgVelSq) * _MaxSpeed;
-            ali = (desired - selfVel);
-        }
-        float3 cohCentroid = cohSum * invN;
-        coh = cohCentroid - selfPos;
+        float invN = 1.0f / (float)countIn;
+        float3 avgVel = aliInS * invN;
+        float aSqv = dot(avgVel, avgVel);
+        float3 aliIn = (aSqv > 1e-12f) ? ((avgVel * rsqrt(aSqv) * s.maxSpeed) - selfVel) : float3(0, 0, 0);
+        float3 cohIn = (cohInS * invN) - selfPos;
+        ali += aliIn * s.inAliW;
+        coh += cohIn * s.inCohW;
     }
+    if (countOut > 0u)
+    {
+        float invN = 1.0f / (float)countOut;
+        float3 avgVel = aliOutS * invN;
+        float aSqv = dot(avgVel, avgVel);
+        float3 aliOut = (aSqv > 1e-12f) ? ((avgVel * rsqrt(aSqv) * s.maxSpeed) - selfVel) : float3(0, 0, 0);
+        float3 cohOut = (cohOutS * invN) - selfPos;
+        ali += aliOut * s.outAliW;
+        coh += cohOut * s.outCohW;
+    }
+    float3 sep = sepIn * s.inSepW + sepOut * s.outSepW;
 
-    // Soft preferred-zone pull.
-    float3 off = selfPos - _PreferredCenter;
-    float3 over = max(abs(off) - _PreferredExtents, float3(0, 0, 0));
-    float overMag = length(over);
+    // Soft per-flock preferred-zone pull.
     float3 boundsForce = float3(0, 0, 0);
-    if (overMag > 1e-6f)
     {
-        float dist = length(off);
-        float maxExtent = max(max(_PreferredExtents.x, _PreferredExtents.y), max(_PreferredExtents.z, 1e-3f));
-        float falloff = saturate(1.0f - dist / maxExtent);
-        float3 dir = (dist > 1e-6f) ? -off / dist : float3(0, 0, 0);
-        boundsForce = dir * (overMag * _PreferredAttractionWeight * (1.0f - falloff * 0.5f));
+        float3 off = selfPos - s.preferredCenter;
+        float3 over = max(abs(off) - s.preferredExtents, float3(0, 0, 0));
+        float overMag = length(over);
+        if (overMag > 1e-6f)
+        {
+            float dist = length(off);
+            float maxExtent = max(max(s.preferredExtents.x, s.preferredExtents.y), max(s.preferredExtents.z, 1e-3f));
+            float falloff = saturate(1.0f - dist / maxExtent);
+            float3 dir = (dist > 1e-6f) ? -off / dist : float3(0, 0, 0);
+            boundsForce = dir * (overMag * s.preferredAttractionWeight * (1.0f - falloff * 0.5f));
+        }
     }
 
-    float3 a = sepAccum * _SepWeight + ali * _AliWeight + coh * _CohWeight + boundsForce;
+    // World hard-bounds inward push (per the CPU ComputeBoundsForceWorldHard).
+    float3 hardBounds = float3(0, 0, 0);
+    {
+        float3 effExt = max(_WorldBoundsExtents - float3(_WorldBoundsMargin, _WorldBoundsMargin, _WorldBoundsMargin), float3(0, 0, 0));
+        float3 off = selfPos - _WorldBoundsCenter;
+        float3 over = max(abs(off) - effExt, float3(0, 0, 0)) * sign(off);
+        hardBounds = -over * _WorldBoundsWeight;
+    }
+
+    // Cursor force — signed reaction with smoothstep falloff inside cursorRadius.
+    float3 cursorForce = float3(0, 0, 0);
+    if (_CursorOnScreen != 0u && s.cursorReactionStrength != 0.0f && s.cursorReactionRadius > 0.0f)
+    {
+        float3 toCursor = _CursorWorldPoint - selfPos;
+        float distSqC = dot(toCursor, toCursor);
+        float radSq = s.cursorReactionRadius * s.cursorReactionRadius;
+        if (distSqC < radSq && distSqC > 1e-12f)
+        {
+            float invD = rsqrt(distSqC);
+            float dist = distSqC * invD;
+            float t = 1.0f - dist / s.cursorReactionRadius;
+            float falloff = t * t * (3.0f - 2.0f * t);
+            float magnitude = abs(s.cursorReactionStrength) * falloff;
+            float sgn = s.cursorReactionStrength >= 0.0f ? 1.0f : -1.0f;
+            cursorForce = toCursor * (invD * magnitude * sgn);
+        }
+    }
+
+    float3 a = sep + ali + coh + boundsForce + hardBounds + cursorForce;
 
     // Cap acceleration.
-    float maxASq = _MaxAcceleration * _MaxAcceleration;
+    float maxASq = s.maxAcceleration * s.maxAcceleration;
     float aSq = dot(a, a);
     if (aSq > maxASq && aSq > 0.0f)
     {
-        a = a * (_MaxAcceleration * rsqrt(aSq));
+        a = a * (s.maxAcceleration * rsqrt(aSq));
     }
 
     // Integrate, clamp speed.
     float3 vel = selfVel + a * _Dt;
-    float speedSq = dot(vel, vel);
-    float minSq = _MinSpeed * _MinSpeed;
-    float maxSq = _MaxSpeed * _MaxSpeed;
-    if (speedSq > maxSq && speedSq > 0.0f)
+    float speedSq2 = dot(vel, vel);
+    float minSq = s.minSpeed * s.minSpeed;
+    float maxSq = s.maxSpeed * s.maxSpeed;
+    if (speedSq2 > maxSq && speedSq2 > 0.0f)
     {
-        vel = vel * (_MaxSpeed * rsqrt(speedSq));
+        vel = vel * (s.maxSpeed * rsqrt(speedSq2));
     }
-    else if (speedSq < minSq)
+    else if (speedSq2 < minSq)
     {
-        if (speedSq > 1e-12f)
+        if (speedSq2 > 1e-12f)
         {
-            vel = vel * (_MinSpeed * rsqrt(speedSq));
+            vel = vel * (s.minSpeed * rsqrt(speedSq2));
         }
         else
         {
-            vel = float3(0, 0, _MinSpeed);
+            vel = float3(0, 0, s.minSpeed);
         }
     }
 

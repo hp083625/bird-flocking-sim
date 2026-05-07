@@ -611,7 +611,7 @@ MonoBehaviour:
   m_Script: {fileID: 11500000, guid: 40f8ce7f59fc748c9a8bdd56e6b3d2df, type: 3}
   m_Name:
   m_EditorClassIdentifier:
-  birdCount: 50000
+  birdCount: 20000
   randomSeed: 42
   worldBoundsCenter: {x: 0, y: 0, z: 0}
   worldBoundsExtents: {x: 50, y: 25, z: 50}

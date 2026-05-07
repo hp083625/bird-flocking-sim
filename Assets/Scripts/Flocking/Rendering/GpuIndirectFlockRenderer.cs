@@ -129,6 +129,27 @@ namespace Bird_behiviour.Flocking.Rendering
             this.argsBuffer = argsBuffer;
         }
 
+        /// <summary>
+        /// P3 multi-flock hook. Pre-clones the source material if needed and binds the
+        /// per-instance flock-id <see cref="GraphicsBuffer"/> + the per-flock RGBA
+        /// palette so the vertex shader can tint per bird via
+        /// <c>_FlockColors[_InstanceFlockIds[SV_InstanceID]]</c>. Caller invokes once
+        /// after init; the cloned material caches both bindings.
+        /// </summary>
+        public void BindShaderFlockData(Material source, GraphicsBuffer instanceFlockIds, Vector4[] palette)
+        {
+            EnsureClonedMaterial(source);
+            if (clonedMaterial == null) return;
+            clonedMaterial.SetBuffer(IdInstanceFlockIds, instanceFlockIds);
+            clonedMaterial.SetVectorArray(IdFlockColors, palette);
+            clonedMaterial.SetFloat(IdUsePerFlockColor, 1f);
+        }
+
+        // Cached property ids for the P3 shader fields (mirrors GpuFlockSimulation).
+        private static readonly int IdInstanceFlockIds = Shader.PropertyToID("_InstanceFlockIds");
+        private static readonly int IdFlockColors      = Shader.PropertyToID("_FlockColors");
+        private static readonly int IdUsePerFlockColor = Shader.PropertyToID("_UsePerFlockColor");
+
         /// <inheritdoc/>
         /// <remarks>
         /// <paramref name="visibleMatrices"/> and <paramref name="visibleCount"/> are
