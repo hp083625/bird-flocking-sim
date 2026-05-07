@@ -1,6 +1,7 @@
 // FlockSettings.cs — ScriptableObject implementation of IFlockSettings.
-// Slice 2 ships the asset only with the default Unity inspector; the custom
-// inspector + tunable / structural split lands in Slice 10 (M5-2).
+// Slice 2 shipped the asset with the default Unity inspector; Slice 10 (M5-2)
+// adds the [FlockTunable] / [FlockStructural] field tagging consumed by the
+// custom inspector in the Editor asmdef (FlockSettingsInspector).
 
 using Bird_behiviour.Flocking.Core;
 using Unity.Mathematics;
@@ -14,10 +15,12 @@ namespace Bird_behiviour.Flocking.Tooling
     /// to a <c>FlockManager</c> in the scene.
     /// </summary>
     /// <remarks>
-    /// Slice 2 deliberately uses the default Unity inspector — the custom inspector with
-    /// tunable / structural split lands in Slice 10 (M5-2). <see cref="OnValidate"/> still
-    /// clamps weights ≥ 0 and enforces <see cref="SeparationRadius"/> ≤
-    /// <see cref="PerceptionRadius"/> so bad asset edits are caught immediately.
+    /// Fields are tagged with <see cref="FlockTunableAttribute"/> (live-edit, no rebuild) or
+    /// <see cref="FlockStructuralAttribute"/> (Apply-button-gated, triggers
+    /// <c>FlockManager.Rebuild</c>) so the custom inspector in the Editor asmdef can route
+    /// them into the correct section. <see cref="OnValidate"/> clamps weights ≥ 0 and
+    /// enforces <see cref="SeparationRadius"/> ≤ <see cref="PerceptionRadius"/> so bad asset
+    /// edits — whether from the inspector or scripted writes — are caught immediately.
     /// </remarks>
     [CreateAssetMenu(menuName = "Flocking/Flock Settings", fileName = "FlockSettings")]
     public class FlockSettings : ScriptableObject, IFlockSettings
@@ -25,53 +28,53 @@ namespace Bird_behiviour.Flocking.Tooling
         // ── Self-flock weights ────────────────────────────────────────────────────────
 
         [Header("Self-Flock Weights")]
-        [SerializeField, Min(0f)] private float inSeparationWeight = 1f;
-        [SerializeField, Min(0f)] private float inAlignmentWeight  = 1f;
-        [SerializeField, Min(0f)] private float inCohesionWeight   = 1f;
+        [SerializeField, Min(0f), FlockTunable] private float inSeparationWeight = 1f;
+        [SerializeField, Min(0f), FlockTunable] private float inAlignmentWeight  = 1f;
+        [SerializeField, Min(0f), FlockTunable] private float inCohesionWeight   = 1f;
 
         // ── Cross-flock weights (binary self-vs-other) ────────────────────────────────
 
         [Header("Cross-Flock Weights")]
-        [SerializeField, Min(0f)] private float outSeparationWeight = 1f;
-        [SerializeField, Min(0f)] private float outAlignmentWeight  = 0f;
-        [SerializeField, Min(0f)] private float outCohesionWeight   = 0f;
+        [SerializeField, Min(0f), FlockTunable] private float outSeparationWeight = 1f;
+        [SerializeField, Min(0f), FlockTunable] private float outAlignmentWeight  = 0f;
+        [SerializeField, Min(0f), FlockTunable] private float outCohesionWeight   = 0f;
 
         // ── Bounds (per-flock soft preferred zone) ────────────────────────────────────
 
         [Header("Bounds (Soft Preferred Zone)")]
-        [SerializeField] private Vector3 preferredCenter  = Vector3.zero;
-        [SerializeField] private Vector3 preferredExtents = new Vector3(20f, 10f, 20f);
-        [SerializeField, Min(0f)] private float preferredAttractionWeight = 1f;
+        [SerializeField, FlockTunable] private Vector3 preferredCenter  = Vector3.zero;
+        [SerializeField, FlockTunable] private Vector3 preferredExtents = new Vector3(20f, 10f, 20f);
+        [SerializeField, Min(0f), FlockTunable] private float preferredAttractionWeight = 1f;
 
         // ── Perception ────────────────────────────────────────────────────────────────
 
         [Header("Perception")]
-        [SerializeField, Min(0f)] private float perceptionRadius = 5f;
-        [SerializeField, Min(0f)] private float separationRadius = 1.5f;
-        [SerializeField, Range(0f, math.PI)] private float perceptionConeHalfAngleRadians = 2.356194f; // 135°
+        [SerializeField, Min(0f), FlockStructural] private float perceptionRadius = 5f;
+        [SerializeField, Min(0f), FlockStructural] private float separationRadius = 1.5f;
+        [SerializeField, Range(0f, math.PI), FlockTunable] private float perceptionConeHalfAngleRadians = 2.356194f; // 135°
 
         // ── Motion ────────────────────────────────────────────────────────────────────
 
         [Header("Motion")]
-        [SerializeField, Min(0f)] private float minSpeed        = 1f;
-        [SerializeField, Min(0f)] private float maxSpeed        = 10f;
-        [SerializeField, Min(0f)] private float maxAcceleration = 30f;
+        [SerializeField, Min(0f), FlockTunable] private float minSpeed        = 1f;
+        [SerializeField, Min(0f), FlockTunable] private float maxSpeed        = 10f;
+        [SerializeField, Min(0f), FlockTunable] private float maxAcceleration = 30f;
 
         // ── Cursor reaction ───────────────────────────────────────────────────────────
 
         [Header("Cursor Reaction")]
         [Tooltip("Positive attracts toward the cursor, negative repels, zero ignores.")]
-        [SerializeField] private float cursorReactionStrength = 0f;
-        [SerializeField, Min(0f)] private float cursorReactionRadius = 10f;
+        [SerializeField, FlockTunable] private float cursorReactionStrength = 0f;
+        [SerializeField, Min(0f), FlockTunable] private float cursorReactionRadius = 10f;
 
         // ── Visual + lifecycle ────────────────────────────────────────────────────────
 
         [Header("Visual + Lifecycle")]
-        [SerializeField, Min(0)] private int birdCount = 100;
-        [SerializeField] private Mesh birdMesh;
-        [SerializeField] private Material birdMaterial;
+        [SerializeField, Min(0), FlockStructural] private int birdCount = 100;
+        [SerializeField, FlockTunable] private Mesh birdMesh;
+        [SerializeField, FlockTunable] private Material birdMaterial;
         [Tooltip("0 = auto-derive from time at spawn; non-zero = deterministic seed.")]
-        [SerializeField] private uint randomSeed = 0u;
+        [SerializeField, FlockTunable] private uint randomSeed = 0u;
 
         // ── IFlockSettings property surface ───────────────────────────────────────────
 
