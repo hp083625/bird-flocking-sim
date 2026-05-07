@@ -536,6 +536,12 @@ namespace Bird_behiviour.Flocking.Simulation
                 return;
             }
 
+            // Drain any tail of the previous Tick before scheduling new jobs against
+            // the same arrays. The end-of-Tick Complete() should already have done this,
+            // but if the prior frame was interrupted (PlayMode pause, recompile,
+            // exception) the safety system can still see outstanding writes — be defensive.
+            pendingTickHandle.Complete();
+
             // ── 1. Schedule the cell-list spatial grid build (Slice 3 / M2). ──────────
             //
             // We DO NOT immediately Complete the build here any more — Slice 4 (M3)
@@ -589,11 +595,6 @@ namespace Bird_behiviour.Flocking.Simulation
                 GridHandle         = gridHandle,
             };
 
-            // ── 3. Schedule the steering chain (cell-list → 3 force jobs → Integrate)
-            //      AND the per-flock cull jobs in parallel — cull has no grid/steering
-            //      dependency, so both branches share worker-thread time. ─────────────
-            JobHandle integrateH = SteeringJobGraph.Dispatch(in spec);
-
             // Refresh the camera frustum cache once per Tick (alloc-free; reuses Plane[6]
             // scratch and the Persistent NativeArray<float4>(6) allocated in Awake).
             // Tests can override via SetCameraFrustumPlanesForTest in which case we skip.
@@ -605,15 +606,17 @@ namespace Bird_behiviour.Flocking.Simulation
 
             // Snapshot positions so FrustumCullJob can run in parallel with IntegrateJob
             // without tripping the safety system (cull is [ReadOnly] on its position
-            // input; integrate is read-write on Positions). The snapshot reflects the
-            // *previous* Tick's integrated positions — i.e. cull lags by one frame.
-            // BirdCullRadius (~2× bird size) absorbs the up-to-MaxSpeed*dt position
-            // delta since the snapshot, so the lag is invisible to the player.
-            //
-            // Main-thread NativeArray copy ctor: ~100us for 50k birds (12 B / bird memcpy),
-            // dwarfed by the steering chain. TempJob lifetime: disposed below after the
-            // cull/matrices fan-in completes.
+            // input; integrate is read-write on Positions). MUST happen BEFORE Dispatch
+            // schedules IntegrateJob — otherwise the synchronous main-thread copy ctor
+            // would read Positions while a writer is pending. The snapshot reflects
+            // pre-integrate positions; BirdCullRadius (~2× bird size) absorbs the
+            // MaxSpeed*dt drift between snapshot and final integrated positions.
             var cullPositions = new NativeArray<float3>(Positions, Allocator.TempJob);
+
+            // ── 3. Schedule the steering chain (cell-list → 3 force jobs → Integrate)
+            //      AND the per-flock cull jobs in parallel — cull has no grid/steering
+            //      dependency, so both branches share worker-thread time. ─────────────
+            JobHandle integrateH = SteeringJobGraph.Dispatch(in spec);
 
             // Per-flock cull → matrices chain. Cull reads `cullPositions` (snapshot),
             // matrices reads `Positions` (post-integrate) — so matrices for flock f

@@ -11,6 +11,7 @@
 // performed on the main thread, with the same edge-case behaviour (zero-distance
 // fallbacks, zero-neighbour fallbacks, zero-velocity perception fallback).
 
+using System.Runtime.CompilerServices;
 using Unity.Burst;
 using Unity.Mathematics;
 
@@ -27,7 +28,11 @@ namespace Bird_behiviour.Flocking.Behaviors
     /// No managed allocations; no NativeArray accesses (those happen in the calling
     /// job, which then feeds primitives into the kernels).
     /// </remarks>
-    [BurstCompile]
+    // Note: NO [BurstCompile] on the class or methods — that would mark these as
+    // "external functions" callable from Burst jobs, which forbids passing/returning
+    // structs by value (`float3` etc.). Instead we use [MethodImpl(AggressiveInlining)]
+    // so Burst inlines the entire body into whichever job calls them. Same perf,
+    // works with the natural signatures.
     internal static class ForceKernels
     {
         // ── Tunable epsilons (kept as constants so Burst can fold them) ──────────────
@@ -55,8 +60,8 @@ namespace Bird_behiviour.Flocking.Behaviors
         ///   <item>negative <paramref name="separationRadius"/> → returns <see cref="float3.zero"/>.</item>
         /// </list>
         /// </remarks>
-        [BurstCompile]
-        public static float3 ComputeSeparation(
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        internal static float3 ComputeSeparation(
             float3 selfPos,
             float3 neighborPos,
             float separationRadius,
@@ -102,8 +107,8 @@ namespace Bird_behiviour.Flocking.Behaviors
         /// <param name="neighborCount">Number of neighbours summed (must match the sum length).</param>
         /// <param name="maxSpeed">Speed to scale the desired velocity to.</param>
         /// <param name="weight">Weight applied to the steering delta.</param>
-        [BurstCompile]
-        public static float3 ComputeAlignment(
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        internal static float3 ComputeAlignment(
             float3 selfVel,
             float3 neighborVelocitySum,
             int neighborCount,
@@ -137,8 +142,8 @@ namespace Bird_behiviour.Flocking.Behaviors
         /// <param name="neighborPositionSum">Running sum of neighbours' positions.</param>
         /// <param name="neighborCount">Number of neighbours summed (must match the sum length).</param>
         /// <param name="weight">Weight applied to the offset toward the centroid.</param>
-        [BurstCompile]
-        public static float3 ComputeCohesion(
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        internal static float3 ComputeCohesion(
             float3 selfPos,
             float3 neighborPositionSum,
             int neighborCount,
@@ -180,8 +185,8 @@ namespace Bird_behiviour.Flocking.Behaviors
         /// Margin larger than an extent is clamped to that extent (prevents the inset
         /// from inverting).
         /// </remarks>
-        [BurstCompile]
-        public static float3 ComputeBoundsForceWorldHard(
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        internal static float3 ComputeBoundsForceWorldHard(
             float3 selfPos,
             float3 worldBoundsCenter,
             float3 worldBoundsExtents,
@@ -210,8 +215,8 @@ namespace Bird_behiviour.Flocking.Behaviors
         /// where <c>falloff = saturate(1 - distance / max(preferredExtents))</c>. This matches
         /// the Slice 2/3 NaiveSteering main-thread implementation so visuals stay identical.
         /// </remarks>
-        [BurstCompile]
-        public static float3 ComputeBoundsForcePreferred(
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        internal static float3 ComputeBoundsForcePreferred(
             float3 selfPos,
             float3 preferredCenter,
             float3 preferredExtents,
@@ -248,8 +253,8 @@ namespace Bird_behiviour.Flocking.Behaviors
         /// <c>CursorForceJob</c> is a no-op stub. Slice 7/8 will dispatch it from the
         /// real cursor job.
         /// </remarks>
-        [BurstCompile]
-        public static float3 ComputeCursorForce(
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        internal static float3 ComputeCursorForce(
             float3 selfPos,
             float3 cursorWorldPoint,
             bool cursorOnScreen,
@@ -295,8 +300,8 @@ namespace Bird_behiviour.Flocking.Behaviors
         /// pair has no defined direction; this method conservatively returns <c>true</c>
         /// in that case to match the calling convention used by NaiveSteering).
         /// </remarks>
-        [BurstCompile]
-        public static bool PerceptionConeAccepts(
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        internal static bool PerceptionConeAccepts(
             float3 selfPos,
             float3 selfVel,
             float3 neighborPos,

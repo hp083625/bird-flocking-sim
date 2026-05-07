@@ -26,7 +26,7 @@ namespace Bird_behiviour.Flocking.Behaviors
     ///   <c>quaternion.LookRotationSafe</c> downstream has a well-defined heading.</item>
     /// </list>
     /// </remarks>
-    [BurstCompile]
+    // [BurstCompile] // disabled by lead — Burst rejects float3-by-value in external-function ABI; revisit by refactoring ForceKernels to in/out signatures
     internal struct IntegrateJob : IJobParallelFor
     {
         [ReadOnly] public NativeArray<float3> AccelNeighbor;

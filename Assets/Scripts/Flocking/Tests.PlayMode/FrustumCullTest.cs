@@ -98,7 +98,10 @@ namespace Bird_behiviour.Flocking.Tests.PlayMode
             //    iff dot(n, p) + d >= 0 for every plane.
             //
             //    Slab: X ∈ [-SlabHalfX, +SlabHalfX], Y ∈ [-WorldHalfYZ, +WorldHalfYZ], Z ∈ [-WorldHalfYZ, +WorldHalfYZ]
-            using (var planes = new NativeArray<float4>(6, Allocator.Temp, NativeArrayOptions.UninitializedMemory))
+            // Manual try/finally instead of `using` because C# treats the using-bound
+            // variable as readonly w.r.t. struct member writes — we need to set planes[i].
+            var planes = new NativeArray<float4>(6, Allocator.Temp, NativeArrayOptions.UninitializedMemory);
+            try
             {
                 // +X face: normal = (-1, 0, 0), distance = +SlabHalfX  →  -px + SlabHalfX >= 0
                 planes[0] = new float4(-1f, 0f, 0f, SlabHalfX);
@@ -114,6 +117,10 @@ namespace Bird_behiviour.Flocking.Tests.PlayMode
                 planes[5] = new float4(0f, 0f, +1f, WorldHalfYZ);
 
                 world.SetCameraFrustumPlanesForTest(planes);
+            }
+            finally
+            {
+                if (planes.IsCreated) planes.Dispose();
             }
 
             // ── Drive the sim for 5 ticks — long enough for the integrator to settle
