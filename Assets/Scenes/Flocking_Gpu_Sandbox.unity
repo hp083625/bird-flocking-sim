@@ -612,9 +612,9 @@ MonoBehaviour:
   m_Name:
   m_EditorClassIdentifier:
   flocks:
-  - name: Prey
-    birdCount: 18000
-    color: {r: 0.4, g: 0.7, b: 1, a: 1}
+  - name: Prey_Current
+    birdCount: 9000
+    color: {r: 0.3, g: 0.6, b: 1, a: 1}
     perceptionRadius: 6
     separationRadius: 1.5
     perceptionConeHalfAngleRadians: 3.14159
@@ -629,8 +629,28 @@ MonoBehaviour:
     outCohesionWeight: 0
     cursorReactionStrength: -80
     cursorReactionRadius: 30
-    preferredCenter: {x: 0, y: 0, z: 0}
-    preferredExtents: {x: 25, y: 10, z: 25}
+    preferredCenter: {x: -30, y: 0, z: 0}
+    preferredExtents: {x: 15, y: 10, z: 25}
+    preferredAttractionWeight: 1
+  - name: Prey_Recommended
+    birdCount: 9000
+    color: {r: 0.3, g: 1, b: 0.4, a: 1}
+    perceptionRadius: 5
+    separationRadius: 1.2
+    perceptionConeHalfAngleRadians: 2.617994
+    minSpeed: 2
+    maxSpeed: 6
+    maxAcceleration: 10
+    inSeparationWeight: 1
+    inAlignmentWeight: 5
+    inCohesionWeight: 2
+    outSeparationWeight: 3
+    outAlignmentWeight: 0
+    outCohesionWeight: 0
+    cursorReactionStrength: -15
+    cursorReactionRadius: 20
+    preferredCenter: {x: 30, y: 0, z: 0}
+    preferredExtents: {x: 15, y: 10, z: 25}
     preferredAttractionWeight: 1
   - name: Predator
     birdCount: 2000
@@ -640,22 +660,22 @@ MonoBehaviour:
     perceptionConeHalfAngleRadians: 3.14159
     minSpeed: 2
     maxSpeed: 14
-    maxAcceleration: 50
-    inSeparationWeight: 1.5
-    inAlignmentWeight: 0.3
-    inCohesionWeight: 0.3
+    maxAcceleration: 25
+    inSeparationWeight: 1
+    inAlignmentWeight: 3
+    inCohesionWeight: 1
     outSeparationWeight: 0
     outAlignmentWeight: 0
-    outCohesionWeight: 15
+    outCohesionWeight: 8
     cursorReactionStrength: 0
     cursorReactionRadius: 10
     preferredCenter: {x: 0, y: 5, z: 0}
-    preferredExtents: {x: 20, y: 8, z: 20}
+    preferredExtents: {x: 40, y: 10, z: 25}
     preferredAttractionWeight: 1
   birdCount: 20000
   randomSeed: 42
   worldBoundsCenter: {x: 0, y: 0, z: 0}
-  worldBoundsExtents: {x: 50, y: 25, z: 50}
+  worldBoundsExtents: {x: 60, y: 25, z: 50}
   perceptionRadius: 5
   separationRadius: 1.5
   minSpeed: 1
