@@ -226,7 +226,7 @@ Each module gets one **epic** issue with linked sub-issues. Sub-issues sized for
 ### M0 — Foundation (sequential, blocks everything)
 1. **M0-1 Repo skeleton.** Folder layout, all asmdefs (empty), `docs/CODING_CONVENTIONS.md`, `.editorconfig`, `.unity-version` file containing `6000.1.15f1`. **Delete `Assets/TutorialInfo/`** (and its `.meta`s). Update `CLAUDE.md` with new folder structure. *Acceptance:* all asmdefs compile; tutorial gone; pre-existing scene still opens.
 2. **M0-2 Core contracts.** Define every type in §4. Full XML doc comments on every public field/method. *Acceptance:* compiles, comments rendered correctly in Rider/VS, contracts review meeting held with all module owners signing off via PR approval.
-3. **M0-3 CI (Tier 2).** GitHub Action via `game-ci/unity-test-runner@v4`, Linux runner, runs EditMode + PlayMode against `Bird_behiviour.Flocking.Tests.*`. **Setup blocker:** Unity license secrets (`UNITY_EMAIL`, `UNITY_PASSWORD`, `UNITY_LICENSE`) must be added to GitHub repo by owner before this lands. Compiler warnings in Flocking assemblies treated as errors; existing template/TextMeshPro warnings filtered by namespace. *Acceptance:* failing test fails the action; compile warning fails the action; passing PR is green; total wall time ≤ 12 min.
+3. **M0-3 (DEFERRED to v1.1) — Automated CI.** Initially planned as `game-ci/unity-test-runner@v4` on Linux runners with Unity license secrets. **Cut from v1** because the team has local Unity + MCP-assisted workflows; tests run locally pre-merge instead, captured in PR description. Re-add when team grows or honor-system breaks. Self-hosted Mac runner is the lighter re-add path (no secrets, reuses local activation).
 4. **M0-4 Reference scene.** `Assets/Scenes/Flocking_Sandbox.unity` containing: one `FlockWorld` GameObject, two `FlockManager` GameObjects (predator + prey) referencing two `FlockSettings` assets, one fly-cam, default lighting (URP). Camera positioned outside `WorldBounds` looking inward. *Acceptance:* scene opens without errors; bounds gizmos visible (world AABB + 2 preferred zones).
 5. **M0-5 Burst cache .gitignore.** Add `Library/PackageCache/` and `Temp/` already-covered, plus explicit `BurstCache/` and `**/*.bclib` (Burst's local artifacts). *Acceptance:* no Burst artifacts staged after a clean build.
 
@@ -301,13 +301,12 @@ A PR is mergeable iff **all** of these are true. Reviewer checks each:
 - [ ] Every `NativeArray`/`SpatialHashGrid`/`GraphicsBuffer` allocated has a matching `Dispose()` in `OnDestroy`/`Deregister`/test teardown. `NativeLeakDetection.Mode = NativeLeakDetectionMode.EnabledWithStackTrace` set in tests.
 - [ ] Public APIs (anything exported from the module's asmdef) carry XML doc comments.
 - [ ] EditMode test for any new pure math; PlayMode test for any new visible behavior.
-- [ ] CI green: compile + EditMode + PlayMode all pass; no warnings in Flocking assemblies.
+- [ ] **Tests pass locally** (compile + EditMode + PlayMode); paste tests-run summary in PR description.
 - [ ] PR ≤ 400 LOC of production code where possible. If larger, tag in description with reason.
 - [ ] Touches only files within the PR's owning module — cross-module changes need a "contracts" PR (touching `Core` only) first.
 - [ ] **Perf-sensitive PRs only:** M6-5 perf gate run locally, p50 captured in PR description, ≤ 16.6 ms.
 
-**One-time setup blockers** (do once, before first PR of any module):
-- Unity license secrets added to GitHub repo (`UNITY_EMAIL`, `UNITY_PASSWORD`, `UNITY_LICENSE`).
+**One-time setup** (do once, before first PR of any module):
 - `.unity-version` file committed at repo root.
 
 ---
