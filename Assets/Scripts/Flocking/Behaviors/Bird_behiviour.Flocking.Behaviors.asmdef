@@ -1,0 +1,20 @@
+{
+    "name": "Bird_behiviour.Flocking.Behaviors",
+    "rootNamespace": "Bird_behiviour.Flocking.Behaviors",
+    "references": [
+        "Bird_behiviour.Flocking.Core",
+        "Bird_behiviour.Flocking.Spatial",
+        "Unity.Burst",
+        "Unity.Collections",
+        "Unity.Mathematics"
+    ],
+    "includePlatforms": [],
+    "excludePlatforms": [],
+    "allowUnsafeCode": false,
+    "overrideReferences": false,
+    "precompiledReferences": [],
+    "autoReferenced": true,
+    "defineConstraints": [],
+    "versionDefines": [],
+    "noEngineReferences": false
+}

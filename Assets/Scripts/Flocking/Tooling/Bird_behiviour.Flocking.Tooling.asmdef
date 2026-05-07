@@ -1,0 +1,18 @@
+{
+    "name": "Bird_behiviour.Flocking.Tooling",
+    "rootNamespace": "Bird_behiviour.Flocking.Tooling",
+    "references": [
+        "Bird_behiviour.Flocking.Core",
+        "Bird_behiviour.Flocking.Simulation",
+        "Unity.Mathematics"
+    ],
+    "includePlatforms": [],
+    "excludePlatforms": [],
+    "allowUnsafeCode": false,
+    "overrideReferences": false,
+    "precompiledReferences": [],
+    "autoReferenced": true,
+    "defineConstraints": [],
+    "versionDefines": [],
+    "noEngineReferences": false
+}

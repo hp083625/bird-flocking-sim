@@ -1,0 +1,20 @@
+{
+    "name": "Bird_behiviour.Flocking.Editor",
+    "rootNamespace": "Bird_behiviour.Flocking.Editor",
+    "references": [
+        "Bird_behiviour.Flocking.Core",
+        "Bird_behiviour.Flocking.Simulation",
+        "Bird_behiviour.Flocking.Tooling"
+    ],
+    "includePlatforms": [
+        "Editor"
+    ],
+    "excludePlatforms": [],
+    "allowUnsafeCode": false,
+    "overrideReferences": false,
+    "precompiledReferences": [],
+    "autoReferenced": true,
+    "defineConstraints": [],
+    "versionDefines": [],
+    "noEngineReferences": false
+}

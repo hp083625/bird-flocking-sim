@@ -1,0 +1,32 @@
+{
+    "name": "Bird_behiviour.Flocking.Tests.EditMode",
+    "rootNamespace": "Bird_behiviour.Flocking.Tests.EditMode",
+    "references": [
+        "Bird_behiviour.Flocking.Core",
+        "Bird_behiviour.Flocking.Simulation",
+        "Bird_behiviour.Flocking.Spatial",
+        "Bird_behiviour.Flocking.Behaviors",
+        "Bird_behiviour.Flocking.Rendering",
+        "Bird_behiviour.Flocking.Tooling",
+        "Bird_behiviour.Flocking.Editor",
+        "Unity.Burst",
+        "Unity.Collections",
+        "Unity.Mathematics"
+    ],
+    "includePlatforms": [
+        "Editor"
+    ],
+    "excludePlatforms": [],
+    "allowUnsafeCode": false,
+    "overrideReferences": false,
+    "precompiledReferences": [],
+    "autoReferenced": true,
+    "defineConstraints": [
+        "UNITY_INCLUDE_TESTS"
+    ],
+    "versionDefines": [],
+    "noEngineReferences": false,
+    "optionalUnityReferences": [
+        "TestAssemblies"
+    ]
+}

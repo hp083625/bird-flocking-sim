@@ -1,0 +1,17 @@
+{
+    "name": "Bird_behiviour.Flocking.Rendering",
+    "rootNamespace": "Bird_behiviour.Flocking.Rendering",
+    "references": [
+        "Bird_behiviour.Flocking.Core",
+        "Unity.Mathematics"
+    ],
+    "includePlatforms": [],
+    "excludePlatforms": [],
+    "allowUnsafeCode": false,
+    "overrideReferences": false,
+    "precompiledReferences": [],
+    "autoReferenced": true,
+    "defineConstraints": [],
+    "versionDefines": [],
+    "noEngineReferences": false
+}
