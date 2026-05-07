@@ -1,7 +1,9 @@
 {
     "name": "Bird_behiviour.Flocking.Core",
     "rootNamespace": "Bird_behiviour.Flocking.Core",
-    "references": [],
+    "references": [
+        "Unity.Mathematics"
+    ],
     "includePlatforms": [],
     "excludePlatforms": [],
     "allowUnsafeCode": false,
