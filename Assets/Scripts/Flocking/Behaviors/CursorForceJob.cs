@@ -31,7 +31,7 @@ namespace Bird_behiviour.Flocking.Behaviors
     /// 1.8+ accepts <c>bool</c> as a job field on Apple Silicon; the kernel itself takes
     /// a <c>bool</c> by value so no extra unpack is required.
     /// </remarks>
-    // [BurstCompile] // disabled by lead — Burst rejects float3-by-value in external-function ABI; revisit by refactoring ForceKernels to in/out signatures
+    [BurstCompile(CompileSynchronously = true)]
     internal struct CursorForceJob : IJobParallelFor
     {
         [ReadOnly] public NativeArray<float3> Positions;

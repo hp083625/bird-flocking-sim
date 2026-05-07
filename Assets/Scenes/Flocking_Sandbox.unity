@@ -153,6 +153,7 @@ MonoBehaviour:
   worldBoundsWeight: 8
   maxSimDt: 0.033333335
   simSpeedMultiplier: 1
+  birdCountMultiplier: 87
 --- !u!4 &94062914
 Transform:
   m_ObjectHideFlags: 0
