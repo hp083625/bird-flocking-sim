@@ -62,6 +62,20 @@ Shader "Bird_behiviour/FlockInstancedURP"
             // SV_InstanceID (= 0..instanceCount-1 from IndirectDrawIndexedArgs).
             StructuredBuffer<float4x4> _Matrices;
 
+            // P3: per-instance flock id buffer, populated by CSBuildMatrices in
+            // FlockSteering.compute. Bound by GpuFlockSimulation. Optional —
+            // when bound, vertex shader looks up _FlockColors[flockId] for tinting.
+            // When NOT bound (legacy CPU path), vertex shader falls back to _BaseColor.
+            StructuredBuffer<uint> _InstanceFlockIds;
+
+            // Per-flock color palette, packed RGBA. Up to 8 flocks for v1; extend
+            // by bumping this constant + the matching SetVectorArray on the C# side.
+            float4 _FlockColors[8];
+
+            // Whether the per-flock palette is active (1) or fall back to _BaseColor (0).
+            // Pushed once per GpuFlockSimulation init via Material.SetFloat.
+            float _UsePerFlockColor;
+
             CBUFFER_START(UnityPerMaterial)
                 float4 _BaseColor;
             CBUFFER_END
@@ -77,6 +91,7 @@ Shader "Bird_behiviour/FlockInstancedURP"
             {
                 float4 positionHCS : SV_POSITION;
                 float3 normalWS    : TEXCOORD0;
+                float4 tint        : TEXCOORD1;
             };
 
             Varyings Vert (Attributes IN)
@@ -88,12 +103,21 @@ Shader "Bird_behiviour/FlockInstancedURP"
 
                 // Inverse-transpose for normals: assume uniform scale (TRS with
                 // scale=(1,1,1) — IntegrateJob doesn't write per-bird scale) so
-                // we can reuse the upper-3x3 of m directly. Saves the matrix
-                // inverse the general-case shader would do.
+                // we can reuse the upper-3x3 of m directly.
                 float3 normalWS = normalize(mul((float3x3)m, IN.normalOS));
 
                 OUT.positionHCS = TransformWorldToHClip(positionWS.xyz);
                 OUT.normalWS    = normalWS;
+
+                if (_UsePerFlockColor > 0.5)
+                {
+                    uint flockId = _InstanceFlockIds[IN.instanceID];
+                    OUT.tint = _FlockColors[flockId & 7u];
+                }
+                else
+                {
+                    OUT.tint = _BaseColor;
+                }
                 return OUT;
             }
 
@@ -101,10 +125,9 @@ Shader "Bird_behiviour/FlockInstancedURP"
             {
                 Light mainLight = GetMainLight();
                 float ndotl = saturate(dot(IN.normalWS, mainLight.direction));
-                // Hemispheric-ish ambient so unlit faces don't go pitch black.
                 half3 ambient = SampleSH(IN.normalWS);
-                half3 lit = _BaseColor.rgb * (ambient + mainLight.color.rgb * ndotl);
-                return half4(lit, _BaseColor.a);
+                half3 lit = IN.tint.rgb * (ambient + mainLight.color.rgb * ndotl);
+                return half4(lit, IN.tint.a);
             }
             ENDHLSL
         }
