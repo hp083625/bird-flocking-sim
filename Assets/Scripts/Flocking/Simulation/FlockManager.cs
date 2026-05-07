@@ -27,10 +27,12 @@ namespace Bird_behiviour.Flocking.Simulation
     /// will narrow the inspector slot to "ScriptableObjects implementing IFlockSettings".
     /// <para/>
     /// <b>Renderer ownership.</b> The manager owns its <see cref="IFlockRenderer"/> instance
-    /// (created in <see cref="OnEnable"/>, disposed in <see cref="OnDisable"/>). Slice 2 hard-
-    /// codes the concrete <see cref="InstancedFlockRenderer"/>; future slices will swap to
-    /// indirect-draw via either a strategy enum or a factory interface in
-    /// <c>Bird_behiviour.Flocking.Core</c>.
+    /// (created in <see cref="OnEnable"/>, disposed in <see cref="OnDisable"/>). Slice 9
+    /// hard-codes the concrete <see cref="IndirectFlockRenderer"/> (Graphics.RenderMeshIndirect
+    /// + per-flock <see cref="UnityEngine.GraphicsBuffer"/> pool). The Slice 2
+    /// <see cref="InstancedFlockRenderer"/> is kept as the reference implementation; a future
+    /// strategy enum or factory in <c>Bird_behiviour.Flocking.Core</c> will let scenes pick
+    /// between them.
     /// <para/>
     /// <b>World discovery.</b> The serialized <see cref="world"/> field is auto-populated from
     /// a parent / scene search in <see cref="OnEnable"/> if left null in the inspector.
@@ -122,7 +124,7 @@ namespace Bird_behiviour.Flocking.Simulation
                 return;
             }
 
-            Renderer = new InstancedFlockRenderer();
+            Renderer = new IndirectFlockRenderer();
             Slice = world.RegisterFlock(this); // Triggers OnSliceAllocated → SpawnIntoSlice.
             registered = true;
         }
@@ -192,7 +194,7 @@ namespace Bird_behiviour.Flocking.Simulation
 
             // Re-register from scratch — RegisterFlock triggers OnSliceAllocated → SpawnIntoSlice
             // which honours the current RandomSeed.
-            Renderer = new InstancedFlockRenderer();
+            Renderer = new IndirectFlockRenderer();
             Slice = world.RegisterFlock(this);
             registered = true;
         }

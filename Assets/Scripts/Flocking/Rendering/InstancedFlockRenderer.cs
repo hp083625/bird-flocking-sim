@@ -40,7 +40,7 @@ namespace Bird_behiviour.Flocking.Rendering
             FlockSlice slice,
             Mesh mesh,
             Material material,
-            NativeArray<float4x4>.ReadOnly visibleMatrices,
+            NativeArray<float4x4> visibleMatrices,
             int visibleCount,
             Camera camera)
         {
