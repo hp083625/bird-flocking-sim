@@ -1,0 +1,19 @@
+{
+  "name": "Bird_behiviour.Flocking.Compute",
+  "rootNamespace": "Bird_behiviour.Flocking.Compute",
+  "references": [
+    "Bird_behiviour.Flocking.Core",
+    "Bird_behiviour.Flocking.Rendering",
+    "Unity.Mathematics",
+    "Unity.Collections"
+  ],
+  "includePlatforms": [],
+  "excludePlatforms": [],
+  "allowUnsafeCode": false,
+  "overrideReferences": false,
+  "precompiledReferences": [],
+  "autoReferenced": true,
+  "defineConstraints": [],
+  "versionDefines": [],
+  "noEngineReferences": false
+}

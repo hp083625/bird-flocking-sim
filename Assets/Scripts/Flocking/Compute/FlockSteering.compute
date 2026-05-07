@@ -1,0 +1,263 @@
+// FlockSteering.compute — GPU steering pipeline for Bird_behiviour.
+//
+// PHASES (this file evolves with the GPU rewrite):
+//   P1 (now)  : HashPass + brute-force SteeringAndIntegratePass + MatricesPass.
+//               Single flock, no cursor / bounds / perception cone. Establishes
+//               buffer wiring + render path. O(N²) — useful as floor-perf reference.
+//   P2 (next) : Add CellStartPass; SteeringPass switches to 27-cell walk consuming
+//               BitonicSort.compute's sorted (cellId, boidId) buffer.
+//   P3        : Multi-flock (FlockSettingsGpu buffer indexed by Boid.flockId), bounds,
+//               cursor, perception cone.
+//   P4        : FrustumCullPass writes per-flock indirect-args buffers.
+//   P5        : Topological-K=8 inner loop in SteeringPass.
+//   P6        : Temporal-coherence — SteeringPass split into Discovery+Apply stages.
+//   P7        : Per-bird self-occlusion cull (Lages 2009).
+//
+// BOID STRUCT — must match Compute/BoidGpu.cs byte-for-byte. 48 bytes, 16-byte
+// aligned. Apple GPU prefers 16B reads; un-aligned reads silently halve throughput.
+//
+// THREADGROUP SIZE — 64. Apple GPU best-practices doc (Apple tech-talk 111373)
+// recommends 64-thread groups for simple, divergence-free kernels. Larger groups
+// increase register pressure on the M-series GPU's per-core simdgroup limit (24
+// simdgroups/core on Apple Family 9 / M3+).
+
+#pragma kernel CSHash
+#pragma kernel CSSteerBruteForce
+#pragma kernel CSBuildMatrices
+
+// ── Boid struct (mirror of Compute/BoidGpu.cs) ────────────────────────────────
+struct Boid
+{
+    float3 pos;
+    uint   flockId;
+    float3 vel;
+    float  pad0;
+    float4 reserved;
+};
+
+// ── Buffers ────────────────────────────────────────────────────────────────────
+RWStructuredBuffer<Boid>     _Boids;            // R+W per tick
+RWStructuredBuffer<uint2>    _CellKeys;         // (cellId, boidId) — written by CSHash, sorted by BitonicSort.compute (P2+)
+RWStructuredBuffer<float4x4> _Matrices;         // written by CSBuildMatrices, consumed by RenderMeshIndirect
+
+// ── Per-tick constants (pushed by GpuFlockSimulation each Tick) ───────────────
+uint  _BirdCount;        // live element count (≤ buffer length)
+float _Dt;               // simulation step seconds
+
+// World-grid params (used by CSHash; SteeringPass uses them in P2+).
+float3 _WorldOrigin;     // bottom-back-left corner of the spatial grid
+float  _CellSize;        // cell edge length (= max perception radius across flocks)
+uint3  _GridDim;         // cells per axis
+
+// Single-flock steering params for P1 (replaced by FlockSettingsGpu buffer in P3).
+float _PerceptionRadius;
+float _SeparationRadius;
+float _MinSpeed;
+float _MaxSpeed;
+float _MaxAcceleration;
+float _SepWeight;
+float _AliWeight;
+float _CohWeight;
+
+// Soft preferred-zone (for P3 we'll move this into FlockSettingsGpu).
+float3 _PreferredCenter;
+float3 _PreferredExtents;
+float  _PreferredAttractionWeight;
+
+// ── Hash helpers ──────────────────────────────────────────────────────────────
+//
+// Teschner et al. 2003 spatial hash. Used by CSHash to bin birds into cells,
+// then BitonicSort.compute sorts (cellId, boidId) so SteeringPass (in P2) can
+// walk the 27-cell window via a CellStart prefix table.
+//
+// The constants are large primes; the XOR-with-multiply pattern is the standard
+// implementation referenced everywhere from Houdini's POPs to UE Niagara.
+uint HashCell(int3 cell)
+{
+    return ((uint)cell.x * 73856093u) ^ ((uint)cell.y * 19349663u) ^ ((uint)cell.z * 83492791u);
+}
+
+int3 WorldToCell(float3 pos)
+{
+    return (int3)floor((pos - _WorldOrigin) / _CellSize);
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// CSHash — one thread per bird. Writes (cellId, boidId) to _CellKeys.
+// BitonicSort.compute then sorts by .x (cellId), so birds within the same cell
+// become contiguous in _CellKeys for the P2 SteeringPass to walk.
+// ──────────────────────────────────────────────────────────────────────────────
+[numthreads(64, 1, 1)]
+void CSHash(uint3 tid : SV_DispatchThreadID)
+{
+    uint i = tid.x;
+    if (i >= _BirdCount) return;
+
+    Boid b = _Boids[i];
+    int3 cell = WorldToCell(b.pos);
+    uint h = HashCell(cell);
+    _CellKeys[i] = uint2(h, i);
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// CSSteerBruteForce — P1 reference path. Each thread sums forces from EVERY
+// other bird (O(N²)). Useful as the floor-perf bench and to validate the buffer
+// wiring before P2 (spatial hash) replaces the inner loop with a 27-cell walk.
+//
+// Branch shape: zero divergence — every thread runs the same loop. Apple GPU
+// loves this kernel; warps stay coherent. The cost scales quadratically in N,
+// so brute-force tops out near 50k on M4 Max before becoming the bottleneck.
+// ──────────────────────────────────────────────────────────────────────────────
+[numthreads(64, 1, 1)]
+void CSSteerBruteForce(uint3 tid : SV_DispatchThreadID)
+{
+    uint i = tid.x;
+    if (i >= _BirdCount) return;
+
+    Boid me = _Boids[i];
+    float3 selfPos = me.pos;
+    float3 selfVel = me.vel;
+
+    float perceptSq = _PerceptionRadius * _PerceptionRadius;
+    float sepRSq    = _SeparationRadius * _SeparationRadius;
+
+    float3 sepAccum = float3(0, 0, 0);
+    float3 aliSum   = float3(0, 0, 0);
+    float3 cohSum   = float3(0, 0, 0);
+    uint   nCount   = 0;
+
+    for (uint j = 0; j < _BirdCount; j++)
+    {
+        if (j == i) continue;
+        Boid nb = _Boids[j];
+        float3 toN = nb.pos - selfPos;
+        float distSq = dot(toN, toN);
+        if (distSq > perceptSq || distSq <= 1e-12f) continue;
+
+        // Separation (per-pair) — only neighbours inside SeparationRadius.
+        if (distSq < sepRSq)
+        {
+            float invD = rsqrt(distSq);
+            float dist = distSq * invD;
+            float fall = 1.0f - dist / _SeparationRadius;
+            sepAccum -= toN * (invD * fall);
+        }
+
+        aliSum += nb.vel;
+        cohSum += nb.pos;
+        nCount++;
+    }
+
+    // Reynolds alignment + cohesion (zero-neighbour fallback returns zero).
+    float3 ali = float3(0, 0, 0);
+    float3 coh = float3(0, 0, 0);
+    if (nCount > 0u)
+    {
+        float invN = 1.0f / (float)nCount;
+        float3 avgVel = aliSum * invN;
+        float avgVelSq = dot(avgVel, avgVel);
+        if (avgVelSq > 1e-12f)
+        {
+            float3 desired = avgVel * rsqrt(avgVelSq) * _MaxSpeed;
+            ali = (desired - selfVel);
+        }
+        float3 cohCentroid = cohSum * invN;
+        coh = cohCentroid - selfPos;
+    }
+
+    // Soft preferred-zone pull — gentle attraction back into the box.
+    float3 off = selfPos - _PreferredCenter;
+    float3 over = max(abs(off) - _PreferredExtents, float3(0, 0, 0));
+    float overMag = length(over);
+    float3 boundsForce = float3(0, 0, 0);
+    if (overMag > 1e-6f)
+    {
+        float dist = length(off);
+        float maxExtent = max(max(_PreferredExtents.x, _PreferredExtents.y), max(_PreferredExtents.z, 1e-3f));
+        float falloff = saturate(1.0f - dist / maxExtent);
+        float3 dir = (dist > 1e-6f) ? -off / dist : float3(0, 0, 0);
+        boundsForce = dir * (overMag * _PreferredAttractionWeight * (1.0f - falloff * 0.5f));
+    }
+
+    float3 a = sepAccum * _SepWeight + ali * _AliWeight + coh * _CohWeight + boundsForce;
+
+    // Cap acceleration via normalize-safe pattern (length² compare).
+    float maxASq = _MaxAcceleration * _MaxAcceleration;
+    float aSq = dot(a, a);
+    if (aSq > maxASq && aSq > 0.0f)
+    {
+        a = a * (_MaxAcceleration * rsqrt(aSq));
+    }
+
+    // Integrate velocity, clamp speed range.
+    float3 vel = selfVel + a * _Dt;
+    float speedSq = dot(vel, vel);
+    float minSq = _MinSpeed * _MinSpeed;
+    float maxSq = _MaxSpeed * _MaxSpeed;
+    if (speedSq > maxSq && speedSq > 0.0f)
+    {
+        vel = vel * (_MaxSpeed * rsqrt(speedSq));
+    }
+    else if (speedSq < minSq)
+    {
+        if (speedSq > 1e-12f)
+        {
+            vel = vel * (_MinSpeed * rsqrt(speedSq));
+        }
+        else
+        {
+            vel = float3(0, 0, _MinSpeed);
+        }
+    }
+
+    me.vel = vel;
+    me.pos = selfPos + vel * _Dt;
+    _Boids[i] = me;
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// CSBuildMatrices — write a TRS float4x4 per bird from pos+vel. Consumed by
+// Graphics.RenderMeshIndirect in GpuIndirectFlockRenderer (no readback).
+//
+// Orientation: heading = normalize(vel), up = world up. Falls back to identity
+// when vel is too short (the Steering pass guarantees vel.length ≥ MinSpeed
+// post-clamp, so the fallback only fires for the very first frame before the
+// first integrate step).
+// ──────────────────────────────────────────────────────────────────────────────
+[numthreads(64, 1, 1)]
+void CSBuildMatrices(uint3 tid : SV_DispatchThreadID)
+{
+    uint i = tid.x;
+    if (i >= _BirdCount) return;
+
+    Boid b = _Boids[i];
+    float3 fwd = b.vel;
+    float speedSq = dot(fwd, fwd);
+    if (speedSq < 1e-6f)
+    {
+        // Identity TRS at position.
+        _Matrices[i] = float4x4(
+            1, 0, 0, b.pos.x,
+            0, 1, 0, b.pos.y,
+            0, 0, 1, b.pos.z,
+            0, 0, 0, 1);
+        return;
+    }
+    fwd = fwd * rsqrt(speedSq);
+
+    float3 worldUp = float3(0, 1, 0);
+    float3 right = normalize(cross(worldUp, fwd));
+    // If fwd ≈ ±worldUp, cross is degenerate — pick a stable fallback.
+    if (dot(right, right) < 1e-6f)
+    {
+        right = float3(1, 0, 0);
+    }
+    float3 up = cross(fwd, right);
+
+    // Column-major TRS: cols are (right, up, fwd, pos).
+    _Matrices[i] = float4x4(
+        right.x, up.x, fwd.x, b.pos.x,
+        right.y, up.y, fwd.y, b.pos.y,
+        right.z, up.z, fwd.z, b.pos.z,
+        0,       0,    0,     1);
+}

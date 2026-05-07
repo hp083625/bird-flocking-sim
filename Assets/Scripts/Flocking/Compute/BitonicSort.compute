@@ -1,0 +1,77 @@
+// BitonicSort.compute — Batcher bitonic sort over RWStructuredBuffer<uint2>.
+// Sorts ASCENDING by .x (key); .y rides along as payload.
+//
+// WHY BITONIC AND NOT MERGE/RADIX:
+// Bitonic is data-oblivious — every thread does the same compare-and-swap each
+// pass, no warp divergence, no scratch memory, no barrier between passes
+// (each pass is its own dispatch so the global memory write is the barrier).
+// Apple GPUs hate divergent control flow; this kernel has none.
+//
+// WHY 64-THREAD GROUPS:
+// Apple's Metal best-practices guidance (tech talk 111373) recommends 64-wide
+// groups for kernels with no shared memory — matches the M-series SIMD width
+// and avoids the 32-wide tail underutilisation seen on NVIDIA-tuned shaders.
+//
+// WHY (stage, pass) AS UNIFORMS NOT SHADER PERMUTATIONS:
+// log2(N)*(log2(N)+1)/2 dispatches at N=256K is 171 — generating 171 kernel
+// variants would blow shader cache for zero perf gain. The two SetInt calls
+// per dispatch are pushed via the constant buffer and don't allocate.
+//
+// PADDING CONTRACT:
+// The C# wrapper sizes the GraphicsBuffer to next-pow-2 and prefills the tail
+// with uint2(0xFFFFFFFF, 0xFFFFFFFF). Sentinels naturally sort to the end and
+// the caller ignores anything past elementCount on read-back.
+
+#pragma kernel BitonicPass
+
+// Sort target. Stride must be 8 (uint2). Length must be a power of two — the
+// wrapper pads up before the first dispatch.
+RWStructuredBuffer<uint2> _Data;
+
+// Bitonic stage / pass selector, set per dispatch by the wrapper.
+//   _Stage  = 1..log2(N), the size of the bitonic sequence being merged
+//   _Pass   = 0.._Stage-1, the bit being compared this sub-pass
+// Partner index is i ^ (1 << (_Stage - 1 - _Pass)).
+// Sort direction within a sub-sequence flips every (1 << _Stage) elements,
+// which is what gives Batcher's network its O(N log² N) behaviour.
+uint _Stage;
+uint _Pass;
+uint _PaddedLength;
+
+[numthreads(64, 1, 1)]
+void BitonicPass(uint3 id : SV_DispatchThreadID)
+{
+    uint i = id.x;
+
+    // One thread per element. Wrapper dispatches ceil(N/64) groups; the tail
+    // group's overshoot threads early-out here rather than read OOB.
+    if (i >= _PaddedLength)
+    {
+        return;
+    }
+
+    uint partnerStride = 1u << (_Stage - 1u - _Pass);
+    uint j = i ^ partnerStride;
+
+    // Each compare-and-swap pair is touched by two threads. Only the lower
+    // index writes — otherwise both threads would race on the same two slots.
+    if (j <= i)
+    {
+        return;
+    }
+
+    // Direction bit: ascending block when this bit of i is 0, descending when 1.
+    // Concatenated ascending+descending blocks form the bitonic sequence the
+    // next stage merges.
+    bool ascending = ((i & (1u << _Stage)) == 0u);
+
+    uint2 a = _Data[i];
+    uint2 b = _Data[j];
+
+    bool swap = ascending ? (a.x > b.x) : (a.x < b.x);
+    if (swap)
+    {
+        _Data[i] = b;
+        _Data[j] = a;
+    }
+}
