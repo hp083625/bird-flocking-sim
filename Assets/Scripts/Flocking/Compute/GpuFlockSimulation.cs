@@ -78,12 +78,21 @@ namespace Bird_behiviour.Flocking.Compute
 
         [Header("Compute shaders (assigned in inspector or auto-loaded)")]
         [SerializeField] private ComputeShader steeringShader;
+        [SerializeField] private ComputeShader bitonicShader;
+        [Tooltip("If true, the spatial-hash path is bypassed and a brute-force O(N²) kernel is used instead. P1 fallback for debugging — leave OFF for perf.")]
+        [SerializeField] private bool useBruteForce = false;
 
         // ── GPU buffers (Persistent — disposed in OnDisable) ────────────────────
         private GraphicsBuffer boidsBuffer;     // RWStructuredBuffer<Boid> — 48 B / element
-        private GraphicsBuffer cellKeysBuffer;  // RWStructuredBuffer<uint2> — 8 B / element (P1: written by CSHash, unused; P2: sorted)
+        private GraphicsBuffer cellKeysBuffer;  // RWStructuredBuffer<uint2> — 8 B / element, padded to next-pow-2 for bitonic
+        private GraphicsBuffer cellStartBuffer; // RWStructuredBuffer<uint>  — 4 B / element, sized to gridDim.x*y*z
         private GraphicsBuffer matricesBuffer;  // RWStructuredBuffer<float4x4> — 64 B / element (consumed by renderer)
         private GraphicsBuffer argsBuffer;      // 1 IndirectDrawIndexedArgs
+
+        // Cached grid sizing — computed in OnEnable from world bounds + perception radius.
+        private int paddedKeyCount;
+        private int cellTotalCount;
+        private uint3 cachedGridDim;
 
         // ── Renderer + helpers ──────────────────────────────────────────────────
         private GpuIndirectFlockRenderer renderer;
@@ -92,14 +101,20 @@ namespace Bird_behiviour.Flocking.Compute
 
         // ── Cached kernel handles ───────────────────────────────────────────────
         private int kHash;
-        private int kSteer;
+        private int kSteerBruteForce;
+        private int kClearCellStart;
+        private int kCellStart;
+        private int kSteerCellList;
         private int kBuildMat;
 
         // ── Cached property ids ─────────────────────────────────────────────────
         private static readonly int IdBoids        = Shader.PropertyToID("_Boids");
         private static readonly int IdCellKeys     = Shader.PropertyToID("_CellKeys");
+        private static readonly int IdCellStart    = Shader.PropertyToID("_CellStart");
         private static readonly int IdMatrices     = Shader.PropertyToID("_Matrices");
         private static readonly int IdBirdCount    = Shader.PropertyToID("_BirdCount");
+        private static readonly int IdPaddedKey    = Shader.PropertyToID("_PaddedKeyCount");
+        private static readonly int IdCellTotal    = Shader.PropertyToID("_CellTotalCount");
         private static readonly int IdDt           = Shader.PropertyToID("_Dt");
         private static readonly int IdWorldOrigin  = Shader.PropertyToID("_WorldOrigin");
         private static readonly int IdCellSize     = Shader.PropertyToID("_CellSize");
@@ -118,6 +133,8 @@ namespace Bird_behiviour.Flocking.Compute
 
         // ── Profiler markers (read by FlockHUD if present) ──────────────────────
         private static readonly ProfilerMarker MkHash      = new ProfilerMarker("Gpu.Hash");
+        private static readonly ProfilerMarker MkSort      = new ProfilerMarker("Gpu.Sort");
+        private static readonly ProfilerMarker MkCellStart = new ProfilerMarker("Gpu.CellStart");
         private static readonly ProfilerMarker MkSteer     = new ProfilerMarker("Gpu.Steer");
         private static readonly ProfilerMarker MkMatrices  = new ProfilerMarker("Gpu.Matrices");
         private static readonly ProfilerMarker MkRender    = new ProfilerMarker("Gpu.Render");
@@ -150,15 +167,39 @@ namespace Bird_behiviour.Flocking.Compute
                 return;
             }
 
-            kHash     = steeringShader.FindKernel("CSHash");
-            kSteer    = steeringShader.FindKernel("CSSteerBruteForce");
-            kBuildMat = steeringShader.FindKernel("CSBuildMatrices");
+            kHash            = steeringShader.FindKernel("CSHash");
+            kSteerBruteForce = steeringShader.FindKernel("CSSteerBruteForce");
+            kClearCellStart  = steeringShader.FindKernel("CSClearCellStart");
+            kCellStart       = steeringShader.FindKernel("CSCellStart");
+            kSteerCellList   = steeringShader.FindKernel("CSSteerCellList");
+            kBuildMat        = steeringShader.FindKernel("CSBuildMatrices");
+
+            // BitonicSort.compute is required when useBruteForce==false. Try to load.
+            if (bitonicShader == null)
+            {
+                bitonicShader = Resources.Load<ComputeShader>("BitonicSort");
+#if UNITY_EDITOR
+                if (bitonicShader == null)
+                {
+                    bitonicShader = UnityEditor.AssetDatabase.LoadAssetAtPath<ComputeShader>(
+                        "Assets/Scripts/Flocking/Compute/BitonicSort.compute");
+                }
+#endif
+            }
+            if (bitonicShader == null && !useBruteForce)
+            {
+                Debug.LogWarning("[GpuFlockSimulation] BitonicSort.compute not found; falling back to brute-force kernel.");
+                useBruteForce = true;
+            }
 
             AllocateBuffers();
             SeedBirds();
             BindBuffersToKernels();
-            EnsureRenderer();
+            // ORDER MATTERS: EnsureArgsBuffer must come BEFORE EnsureRenderer so the
+            // renderer's BindIndirectArgsBuffer call sees a non-null buffer. Otherwise
+            // the renderer caches `argsBuffer == null` and every Render() early-outs.
             EnsureArgsBuffer();
+            EnsureRenderer();
 
             // Prefer running while the editor isn't focused (else macOS throttles us).
             Application.runInBackground = true;
@@ -171,24 +212,39 @@ namespace Bird_behiviour.Flocking.Compute
                 renderer.Dispose();
                 renderer = null;
             }
-            if (boidsBuffer != null)    { boidsBuffer.Dispose();    boidsBuffer    = null; }
-            if (cellKeysBuffer != null) { cellKeysBuffer.Dispose(); cellKeysBuffer = null; }
-            if (matricesBuffer != null) { matricesBuffer.Dispose(); matricesBuffer = null; }
-            if (argsBuffer != null)     { argsBuffer.Dispose();     argsBuffer     = null; }
+            if (boidsBuffer != null)     { boidsBuffer.Dispose();     boidsBuffer     = null; }
+            if (cellKeysBuffer != null)  { cellKeysBuffer.Dispose();  cellKeysBuffer  = null; }
+            if (cellStartBuffer != null) { cellStartBuffer.Dispose(); cellStartBuffer = null; }
+            if (matricesBuffer != null)  { matricesBuffer.Dispose();  matricesBuffer  = null; }
+            if (argsBuffer != null)      { argsBuffer.Dispose();      argsBuffer      = null; }
         }
 
         private void AllocateBuffers()
         {
+            // Compute grid sizing once. CellSize tracks PerceptionRadius so the 27-cell
+            // walk is a tight superset of the perception sphere.
+            float cellSize = math.max(0.01f, perceptionRadius);
+            float3 sizeF   = ((float3)worldBoundsExtents) * 2f / cellSize;
+            cachedGridDim  = new uint3(
+                (uint)math.max(1, (int)math.ceil(sizeF.x)),
+                (uint)math.max(1, (int)math.ceil(sizeF.y)),
+                (uint)math.max(1, (int)math.ceil(sizeF.z)));
+            cellTotalCount = (int)(cachedGridDim.x * cachedGridDim.y * cachedGridDim.z);
+            paddedKeyCount = NextPowerOfTwo(birdCount);
+
             // Boids buffer — one element per bird, 48-byte stride matching BoidGpu.
-            boidsBuffer    = new GraphicsBuffer(GraphicsBuffer.Target.Structured, birdCount, BoidGpu.Stride);
+            boidsBuffer     = new GraphicsBuffer(GraphicsBuffer.Target.Structured, birdCount, BoidGpu.Stride);
 
-            // CellKeys — one (cellId, boidId) per bird. P2's bitonic sort wants this padded
-            // to the next power of two; we over-allocate now so P2 doesn't trigger a realloc.
-            int paddedLen = NextPowerOfTwo(birdCount);
-            cellKeysBuffer = new GraphicsBuffer(GraphicsBuffer.Target.Structured, paddedLen, sizeof(uint) * 2);
+            // CellKeys — padded to next-pow-2 so BitonicSort works in place. The padded
+            // tail (indices >= birdCount) is filled with 0xFFFFFFFF sentinels by CSHash
+            // every frame, so the sort drops them at the end.
+            cellKeysBuffer  = new GraphicsBuffer(GraphicsBuffer.Target.Structured, paddedKeyCount, sizeof(uint) * 2);
 
-            // Matrices — one float4x4 per bird, consumed by RenderMeshIndirect.
-            matricesBuffer = new GraphicsBuffer(GraphicsBuffer.Target.Structured, birdCount, sizeof(float) * 16);
+            // CellStart — one slot per grid cell. Reset each frame by CSClearCellStart.
+            cellStartBuffer = new GraphicsBuffer(GraphicsBuffer.Target.Structured, cellTotalCount, sizeof(uint));
+
+            // Matrices — one float4x4 per bird.
+            matricesBuffer  = new GraphicsBuffer(GraphicsBuffer.Target.Structured, birdCount, sizeof(float) * 16);
         }
 
         private void EnsureArgsBuffer()
@@ -264,11 +320,26 @@ namespace Bird_behiviour.Flocking.Compute
 
         private void BindBuffersToKernels()
         {
-            steeringShader.SetBuffer(kHash,     IdBoids,    boidsBuffer);
-            steeringShader.SetBuffer(kHash,     IdCellKeys, cellKeysBuffer);
+            // Hash: writes (cellId, boidId) for live birds, sentinel for padded tail.
+            steeringShader.SetBuffer(kHash, IdBoids,    boidsBuffer);
+            steeringShader.SetBuffer(kHash, IdCellKeys, cellKeysBuffer);
 
-            steeringShader.SetBuffer(kSteer,    IdBoids,    boidsBuffer);
+            // ClearCellStart: writes sentinel value into _CellStart.
+            steeringShader.SetBuffer(kClearCellStart, IdCellStart, cellStartBuffer);
 
+            // CellStart: scans sorted _CellKeys, writes index into _CellStart.
+            steeringShader.SetBuffer(kCellStart, IdCellKeys,  cellKeysBuffer);
+            steeringShader.SetBuffer(kCellStart, IdCellStart, cellStartBuffer);
+
+            // SteerCellList: reads everything, writes back to _Boids.
+            steeringShader.SetBuffer(kSteerCellList, IdBoids,    boidsBuffer);
+            steeringShader.SetBuffer(kSteerCellList, IdCellKeys, cellKeysBuffer);
+            steeringShader.SetBuffer(kSteerCellList, IdCellStart, cellStartBuffer);
+
+            // SteerBruteForce: P1 fallback path — only reads/writes Boids.
+            steeringShader.SetBuffer(kSteerBruteForce, IdBoids, boidsBuffer);
+
+            // BuildMatrices: reads Boids, writes Matrices.
             steeringShader.SetBuffer(kBuildMat, IdBoids,    boidsBuffer);
             steeringShader.SetBuffer(kBuildMat, IdMatrices, matricesBuffer);
         }
@@ -282,20 +353,16 @@ namespace Bird_behiviour.Flocking.Compute
             if (dt <= 0f) return;
 
             // ── Push constants ──────────────────────────────────────────────────
-            steeringShader.SetInt   (IdBirdCount, birdCount);
-            steeringShader.SetFloat (IdDt,        dt);
+            steeringShader.SetInt   (IdBirdCount,  birdCount);
+            steeringShader.SetInt   (IdPaddedKey,  paddedKeyCount);
+            steeringShader.SetInt   (IdCellTotal,  cellTotalCount);
+            steeringShader.SetFloat (IdDt,         dt);
 
-            // World grid params — used by CSHash now, by SteeringPass once P2 lands.
             float cellSize = math.max(0.01f, perceptionRadius);
             float3 origin  = (float3)worldBoundsCenter - (float3)worldBoundsExtents;
-            float3 sizeF   = ((float3)worldBoundsExtents) * 2f / cellSize;
-            uint3  gridDim = new uint3(
-                (uint)math.max(1, (int)math.ceil(sizeF.x)),
-                (uint)math.max(1, (int)math.ceil(sizeF.y)),
-                (uint)math.max(1, (int)math.ceil(sizeF.z)));
             steeringShader.SetVector(IdWorldOrigin, new Vector4(origin.x, origin.y, origin.z, 0f));
             steeringShader.SetFloat (IdCellSize,    cellSize);
-            steeringShader.SetInts  (IdGridDim, (int)gridDim.x, (int)gridDim.y, (int)gridDim.z);
+            steeringShader.SetInts  (IdGridDim, (int)cachedGridDim.x, (int)cachedGridDim.y, (int)cachedGridDim.z);
 
             // Single-flock steering params (P3 will switch to a buffer indexed by flockId).
             steeringShader.SetFloat(IdPercept,     perceptionRadius);
@@ -311,11 +378,31 @@ namespace Bird_behiviour.Flocking.Compute
             steeringShader.SetFloat (IdPrefAttract, preferredAttractionWeight);
 
             // ── Dispatch ────────────────────────────────────────────────────────
-            int groups = (birdCount + 63) / 64;
+            int groupsBird = (birdCount + 63) / 64;
+            int groupsKey  = (paddedKeyCount + 63) / 64;
+            int groupsCell = (cellTotalCount + 63) / 64;
 
-            using (MkHash.Auto())     { steeringShader.Dispatch(kHash,     groups, 1, 1); }
-            using (MkSteer.Auto())    { steeringShader.Dispatch(kSteer,    groups, 1, 1); }
-            using (MkMatrices.Auto()) { steeringShader.Dispatch(kBuildMat, groups, 1, 1); }
+            if (useBruteForce)
+            {
+                // P1 floor-perf path. Skips the spatial-hash chain entirely.
+                using (MkSteer.Auto())    { steeringShader.Dispatch(kSteerBruteForce, groupsBird, 1, 1); }
+                using (MkMatrices.Auto()) { steeringShader.Dispatch(kBuildMat,        groupsBird, 1, 1); }
+            }
+            else
+            {
+                // P2 production path: Hash → Sort → ClearCellStart → CellStart → SteerCellList → BuildMatrices.
+                // Each Dispatch call is a global memory barrier on the GPU, so no explicit
+                // synchronization is needed between the stages.
+                using (MkHash.Auto())      { steeringShader.Dispatch(kHash, groupsKey, 1, 1); }
+                using (MkSort.Auto())      { BitonicSort.Sort(bitonicShader, cellKeysBuffer, paddedKeyCount); }
+                using (MkCellStart.Auto())
+                {
+                    steeringShader.Dispatch(kClearCellStart, groupsCell, 1, 1);
+                    steeringShader.Dispatch(kCellStart,      groupsKey,  1, 1);
+                }
+                using (MkSteer.Auto())    { steeringShader.Dispatch(kSteerCellList, groupsBird, 1, 1); }
+                using (MkMatrices.Auto()) { steeringShader.Dispatch(kBuildMat,      groupsBird, 1, 1); }
+            }
 
             // ── Render ──────────────────────────────────────────────────────────
             using (MkRender.Auto())

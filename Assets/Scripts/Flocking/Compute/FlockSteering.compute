@@ -23,6 +23,9 @@
 
 #pragma kernel CSHash
 #pragma kernel CSSteerBruteForce
+#pragma kernel CSClearCellStart
+#pragma kernel CSCellStart
+#pragma kernel CSSteerCellList
 #pragma kernel CSBuildMatrices
 
 // ── Boid struct (mirror of Compute/BoidGpu.cs) ────────────────────────────────
@@ -37,8 +40,18 @@ struct Boid
 
 // ── Buffers ────────────────────────────────────────────────────────────────────
 RWStructuredBuffer<Boid>     _Boids;            // R+W per tick
-RWStructuredBuffer<uint2>    _CellKeys;         // (cellId, boidId) — written by CSHash, sorted by BitonicSort.compute (P2+)
+RWStructuredBuffer<uint2>    _CellKeys;         // (cellId, boidId) — written by CSHash, sorted by BitonicSort.compute (P2)
+RWStructuredBuffer<uint>     _CellStart;        // cellStart[cellId] = first index in _CellKeys that has that cellId; 0xFFFFFFFF when empty
 RWStructuredBuffer<float4x4> _Matrices;         // written by CSBuildMatrices, consumed by RenderMeshIndirect
+
+// CellStart sentinel: any read >= _PaddedKeyCount means "no birds in that cell".
+// We use _PaddedKeyCount itself (not 0xFFFFFFFF) as the sentinel because the
+// reset kernel can write it via a single SetInt'd uint and the SteeringPass
+// already has _PaddedKeyCount in scope as the iteration upper bound for cellEnd
+// (so two cells in a row produce the right empty-cell behaviour without a
+// special-case branch).
+uint _PaddedKeyCount;     // = next power of two ≥ _BirdCount (size of _CellKeys)
+uint _CellTotalCount;     // = _GridDim.x * _GridDim.y * _GridDim.z (size of _CellStart)
 
 // ── Per-tick constants (pushed by GpuFlockSimulation each Tick) ───────────────
 uint  _BirdCount;        // live element count (≤ buffer length)
@@ -66,20 +79,23 @@ float  _PreferredAttractionWeight;
 
 // ── Hash helpers ──────────────────────────────────────────────────────────────
 //
-// Teschner et al. 2003 spatial hash. Used by CSHash to bin birds into cells,
-// then BitonicSort.compute sorts (cellId, boidId) so SteeringPass (in P2) can
-// walk the 27-cell window via a CellStart prefix table.
+// P2 grid: a flat index x + y*Gx + z*Gx*Gy. Cells outside the grid are clamped
+// to the boundary cell. This bounds _CellStart's size at gridDim.x*y*z (~4000
+// for our default 50×25×50 world with 5-unit cells), which is small enough that
+// CSClearCellStart is a single dispatch and CSCellStart can write at random.
 //
-// The constants are large primes; the XOR-with-multiply pattern is the standard
-// implementation referenced everywhere from Houdini's POPs to UE Niagara.
-uint HashCell(int3 cell)
-{
-    return ((uint)cell.x * 73856093u) ^ ((uint)cell.y * 19349663u) ^ ((uint)cell.z * 83492791u);
-}
-
+// We use a flat grid (not Teschner's hash-table-with-collisions) because at our
+// scale the grid IS the hash table — collisions are zero, and the SteeringPass
+// doesn't need to filter spurious neighbours from collided cells.
 int3 WorldToCell(float3 pos)
 {
-    return (int3)floor((pos - _WorldOrigin) / _CellSize);
+    int3 c = (int3)floor((pos - _WorldOrigin) / _CellSize);
+    return clamp(c, int3(0, 0, 0), int3(_GridDim) - int3(1, 1, 1));
+}
+
+uint FlatCellId(int3 cell)
+{
+    return (uint)cell.x + (uint)cell.y * _GridDim.x + (uint)cell.z * _GridDim.x * _GridDim.y;
 }
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -91,12 +107,216 @@ int3 WorldToCell(float3 pos)
 void CSHash(uint3 tid : SV_DispatchThreadID)
 {
     uint i = tid.x;
-    if (i >= _BirdCount) return;
+    // Live birds get their cell id; padded tail [_BirdCount, _PaddedKeyCount) gets
+    // the sentinel (0xFFFFFFFF, 0xFFFFFFFF) so BitonicSort's ascending sort drops
+    // them at the end of _CellKeys where CSCellStart will ignore them.
+    if (i >= _PaddedKeyCount) return;
+    if (i >= _BirdCount)
+    {
+        _CellKeys[i] = uint2(0xFFFFFFFFu, 0xFFFFFFFFu);
+        return;
+    }
 
     Boid b = _Boids[i];
     int3 cell = WorldToCell(b.pos);
-    uint h = HashCell(cell);
+    uint h = FlatCellId(cell);
     _CellKeys[i] = uint2(h, i);
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// CSClearCellStart — one thread per grid cell. Resets _CellStart to the "empty"
+// sentinel before each tick's CSCellStart pass.
+//
+// Sentinel value is _PaddedKeyCount (the live-key range upper bound). When
+// CSSteerCellList reads _CellStart[c] and gets a value >= _PaddedKeyCount, it
+// treats that cell as empty without a special branch — the cell-walk loop's
+// "for (uint k = start; k < end; ++k)" naturally short-circuits because
+// start == end at the empty sentinel.
+// ──────────────────────────────────────────────────────────────────────────────
+[numthreads(64, 1, 1)]
+void CSClearCellStart(uint3 tid : SV_DispatchThreadID)
+{
+    uint c = tid.x;
+    if (c >= _CellTotalCount) return;
+    _CellStart[c] = _PaddedKeyCount;
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// CSCellStart — one thread per element of (sorted) _CellKeys. Writes the index
+// of the FIRST occurrence of each cellId into _CellStart[cellId]. Race-free
+// because each cellId is written by exactly one thread (whichever has the
+// lowest .x for that cellId).
+//
+// The "end" of cell c is implied: it's the start of the next non-empty cell.
+// CSSteerCellList walks until cellKeys[k].x changes (rather than relying on a
+// separate cellEnd array). This keeps the cell table at one buffer instead of
+// two and saves ~20% memory on the spatial structure.
+// ──────────────────────────────────────────────────────────────────────────────
+[numthreads(64, 1, 1)]
+void CSCellStart(uint3 tid : SV_DispatchThreadID)
+{
+    uint i = tid.x;
+    if (i >= _PaddedKeyCount) return;
+
+    uint thisCell = _CellKeys[i].x;
+    if (thisCell == 0xFFFFFFFFu) return; // padded tail — skip
+
+    if (i == 0u)
+    {
+        _CellStart[thisCell] = i;
+    }
+    else
+    {
+        uint prevCell = _CellKeys[i - 1u].x;
+        if (thisCell != prevCell)
+        {
+            _CellStart[thisCell] = i;
+        }
+    }
+}
+
+// ──────────────────────────────────────────────────────────────────────────────
+// CSSteerCellList — P2 hot path. Each thread reads its bird, walks the 27-cell
+// neighbourhood via _CellStart, accumulates separation/alignment/cohesion +
+// soft preferred-zone, integrates, writes back.
+//
+// The 27-cell loop is unrolled for branch coherence — every thread visits the
+// same cells, just possibly with different cellStart values. Per-cell inner
+// loop walks until cellKeys[k].x changes (the implicit cellEnd marker).
+// ──────────────────────────────────────────────────────────────────────────────
+[numthreads(64, 1, 1)]
+void CSSteerCellList(uint3 tid : SV_DispatchThreadID)
+{
+    uint i = tid.x;
+    if (i >= _BirdCount) return;
+
+    Boid me = _Boids[i];
+    float3 selfPos = me.pos;
+    float3 selfVel = me.vel;
+
+    int3 myCell = WorldToCell(selfPos);
+
+    float perceptSq = _PerceptionRadius * _PerceptionRadius;
+    float sepRSq    = _SeparationRadius * _SeparationRadius;
+
+    float3 sepAccum = float3(0, 0, 0);
+    float3 aliSum   = float3(0, 0, 0);
+    float3 cohSum   = float3(0, 0, 0);
+    uint   nCount   = 0;
+
+    [unroll] for (int dz = -1; dz <= 1; ++dz)
+    {
+        [unroll] for (int dy = -1; dy <= 1; ++dy)
+        {
+            [unroll] for (int dx = -1; dx <= 1; ++dx)
+            {
+                int3 cell = myCell + int3(dx, dy, dz);
+                // Bounds check — birds against the world wall don't have full neighbourhoods.
+                if (cell.x < 0 || cell.y < 0 || cell.z < 0 ||
+                    cell.x >= (int)_GridDim.x || cell.y >= (int)_GridDim.y || cell.z >= (int)_GridDim.z)
+                {
+                    continue;
+                }
+
+                uint cid = FlatCellId(cell);
+                uint start = _CellStart[cid];
+                if (start >= _PaddedKeyCount) continue; // empty cell
+
+                // Walk forward in _CellKeys until cellId changes.
+                for (uint k = start; k < _PaddedKeyCount; ++k)
+                {
+                    uint2 entry = _CellKeys[k];
+                    if (entry.x != cid) break;
+
+                    uint j = entry.y;
+                    if (j == i) continue;
+
+                    Boid nb = _Boids[j];
+                    float3 toN = nb.pos - selfPos;
+                    float distSq = dot(toN, toN);
+                    if (distSq > perceptSq || distSq <= 1e-12f) continue;
+
+                    if (distSq < sepRSq)
+                    {
+                        float invD = rsqrt(distSq);
+                        float dist = distSq * invD;
+                        float fall = 1.0f - dist / _SeparationRadius;
+                        sepAccum -= toN * (invD * fall);
+                    }
+
+                    aliSum += nb.vel;
+                    cohSum += nb.pos;
+                    nCount++;
+                }
+            }
+        }
+    }
+
+    // Reynolds alignment + cohesion (zero-neighbour fallback returns zero).
+    float3 ali = float3(0, 0, 0);
+    float3 coh = float3(0, 0, 0);
+    if (nCount > 0u)
+    {
+        float invN = 1.0f / (float)nCount;
+        float3 avgVel = aliSum * invN;
+        float avgVelSq = dot(avgVel, avgVel);
+        if (avgVelSq > 1e-12f)
+        {
+            float3 desired = avgVel * rsqrt(avgVelSq) * _MaxSpeed;
+            ali = (desired - selfVel);
+        }
+        float3 cohCentroid = cohSum * invN;
+        coh = cohCentroid - selfPos;
+    }
+
+    // Soft preferred-zone pull.
+    float3 off = selfPos - _PreferredCenter;
+    float3 over = max(abs(off) - _PreferredExtents, float3(0, 0, 0));
+    float overMag = length(over);
+    float3 boundsForce = float3(0, 0, 0);
+    if (overMag > 1e-6f)
+    {
+        float dist = length(off);
+        float maxExtent = max(max(_PreferredExtents.x, _PreferredExtents.y), max(_PreferredExtents.z, 1e-3f));
+        float falloff = saturate(1.0f - dist / maxExtent);
+        float3 dir = (dist > 1e-6f) ? -off / dist : float3(0, 0, 0);
+        boundsForce = dir * (overMag * _PreferredAttractionWeight * (1.0f - falloff * 0.5f));
+    }
+
+    float3 a = sepAccum * _SepWeight + ali * _AliWeight + coh * _CohWeight + boundsForce;
+
+    // Cap acceleration.
+    float maxASq = _MaxAcceleration * _MaxAcceleration;
+    float aSq = dot(a, a);
+    if (aSq > maxASq && aSq > 0.0f)
+    {
+        a = a * (_MaxAcceleration * rsqrt(aSq));
+    }
+
+    // Integrate, clamp speed.
+    float3 vel = selfVel + a * _Dt;
+    float speedSq = dot(vel, vel);
+    float minSq = _MinSpeed * _MinSpeed;
+    float maxSq = _MaxSpeed * _MaxSpeed;
+    if (speedSq > maxSq && speedSq > 0.0f)
+    {
+        vel = vel * (_MaxSpeed * rsqrt(speedSq));
+    }
+    else if (speedSq < minSq)
+    {
+        if (speedSq > 1e-12f)
+        {
+            vel = vel * (_MinSpeed * rsqrt(speedSq));
+        }
+        else
+        {
+            vel = float3(0, 0, _MinSpeed);
+        }
+    }
+
+    me.vel = vel;
+    me.pos = selfPos + vel * _Dt;
+    _Boids[i] = me;
 }
 
 // ──────────────────────────────────────────────────────────────────────────────

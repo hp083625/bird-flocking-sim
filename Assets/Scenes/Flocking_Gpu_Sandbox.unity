@@ -549,7 +549,7 @@ GameObject:
   m_Icon: {fileID: 0}
   m_NavMeshLayer: 0
   m_StaticEditorFlags: 0
-  m_IsActive: 1
+  m_IsActive: 0
 --- !u!114 &2100000001
 MonoBehaviour:
   m_ObjectHideFlags: 0
@@ -631,6 +631,8 @@ MonoBehaviour:
   birdMesh: {fileID: 4300000, guid: 750a2c182d36147379c2568ef21c867c, type: 2}
   birdMaterial: {fileID: 2100000, guid: a36e4d1241dbe4cf8af10c1f9bdf2039, type: 2}
   steeringShader: {fileID: 7200000, guid: e31c51433d7ef4122bd4c3cd502c5bd3, type: 3}
+  bitonicShader: {fileID: 7200000, guid: d2cbcd25876de47b3a1084cb84d12f45, type: 3}
+  useBruteForce: 0
 --- !u!4 &3000000003
 Transform:
   m_ObjectHideFlags: 0
