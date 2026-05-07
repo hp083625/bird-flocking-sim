@@ -4,6 +4,7 @@
     "references": [
         "Bird_behiviour.Flocking.Core",
         "Bird_behiviour.Flocking.Rendering",
+        "Bird_behiviour.Flocking.Spatial",
         "Unity.Burst",
         "Unity.Collections",
         "Unity.Mathematics"

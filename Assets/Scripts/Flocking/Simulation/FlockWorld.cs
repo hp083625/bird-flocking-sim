@@ -1,9 +1,12 @@
 // FlockWorld.cs — scene-singleton owner of all per-bird state and per-frame simulation.
-// M1 in FLOCKING_PLAN.md. Slice 2 ships the naive O(n²) main-thread Tick; Slice 4 (M3) replaces
-// the steering body with a job graph and Slice 5 (M2) adds the spatial grid.
+// M1 in FLOCKING_PLAN.md. Slice 3 (M2) wires in the cell-list spatial grid:
+// FlockWorld owns a CellListSpatialIndex, rebuilds it each Tick before steering, and the
+// steering helpers consume it via SpatialIndexReadOnly.GetNeighbors instead of the old
+// O(n²) loop. Slice 4 (M3) will jobify + Burst-compile the steering itself.
 
 using System.Collections.Generic;
 using Bird_behiviour.Flocking.Core;
+using Bird_behiviour.Flocking.Spatial;
 using Unity.Collections;
 using Unity.Mathematics;
 using UnityEngine;
@@ -102,6 +105,17 @@ namespace Bird_behiviour.Flocking.Simulation
         public int TotalBirdCount { get; private set; }
 
         private bool arraysAllocated;
+
+        // ── Spatial index (Slice 3 / M2) ─────────────────────────────────────────────
+
+        // Owned by FlockWorld; allocated lazily in ReallocateForCurrentRegistration once
+        // we know the max perception radius across registered flocks. Disposed in
+        // OnDestroy. Cell size is auto-derived as max(perceptionRadius); rebuilt each
+        // Tick via ScheduleBuild.
+        private CellListSpatialIndex spatialIndex;
+
+        /// <summary>Current grid cell size (max <c>PerceptionRadius</c> across registered flocks).</summary>
+        public float CellSize => spatialIndex != null ? spatialIndex.CellSize : 0f;
 
         // ── Registration API ──────────────────────────────────────────────────────────
 
@@ -203,11 +217,46 @@ namespace Bird_behiviour.Flocking.Simulation
 
             arraysAllocated = true;
 
+            // (Re-)size the spatial grid for the new registration. Cell size is auto-
+            // derived as max(perceptionRadius across registered flocks); per FLOCKING_PLAN
+            // §6 M2-4. World bounds drive the per-axis cell counts.
+            ResizeSpatialIndex();
+
             // Notify each manager so it can spawn into its (possibly new) slice.
             for (int i = 0; i < registered.Count; i++)
             {
                 registered[i].OnSliceAllocated(Slices[i]);
             }
+        }
+
+        private void ResizeSpatialIndex()
+        {
+            if (spatialIndex == null)
+            {
+                spatialIndex = new CellListSpatialIndex();
+            }
+
+            if (TotalBirdCount == 0 || registered.Count == 0)
+            {
+                // Nothing to index — release any prior allocation so we don't hold cells
+                // we won't query.
+                spatialIndex.Dispose();
+                return;
+            }
+
+            float maxPerception = 0f;
+            for (int i = 0; i < registered.Count; i++)
+            {
+                IFlockSettings s = registered[i].Settings;
+                if (s == null) continue;
+                maxPerception = math.max(maxPerception, s.PerceptionRadius);
+            }
+
+            // Defensive default: fall back to a 1m cell if every flock reports 0 (mis-
+            // configured asset). Keeps the build from dividing by zero.
+            float cellSize = maxPerception > 0f ? maxPerception : 1f;
+
+            spatialIndex.Resize(WorldBoundsCenter, WorldBoundsExtents, cellSize, TotalBirdCount);
         }
 
         private void DisposeArrays()
@@ -270,13 +319,17 @@ namespace Bird_behiviour.Flocking.Simulation
         }
 
         /// <summary>
-        /// Slice-3-shaped extension point: Slice 3 (M2 Spatial) will store a
-        /// <c>SpatialHashGrid</c> reference on this MonoBehaviour and dispose it here.
-        /// Slice 10 ships the no-op so <see cref="Rebuild"/> already calls a stable hook.
+        /// Disposes the cell-list spatial grid (if allocated). Called from
+        /// <see cref="Rebuild"/> so the next <see cref="Tick"/> re-allocates against the
+        /// freshly-registered flock set, and from <see cref="OnDestroy"/>.
         /// </summary>
         private void DisposeSpatialIndex()
         {
-            // Intentional no-op until Slice 3 lands the spatial index field on FlockWorld.
+            if (spatialIndex != null)
+            {
+                spatialIndex.Dispose();
+                spatialIndex = null;
+            }
         }
 
         // ── Unity lifecycle ──────────────────────────────────────────────────────────
@@ -314,22 +367,38 @@ namespace Bird_behiviour.Flocking.Simulation
                 return;
             }
 
-            // 1. Compute accelerations (naïve O(n²); replaced by job graph in Slice 4).
+            // 1. Build the cell-list spatial grid for this frame's positions. We schedule
+            //    + immediately Complete so the rest of Tick stays main-thread (Slice 3
+            //    doesn't jobify steering; that's Slice 4's work). With the grid in place
+            //    the neighbour scan drops from O(n²) to O(n · avg_cell_occupancy).
+            SpatialIndexReadOnly spatial = default;
+            if (spatialIndex != null && spatialIndex.IsAllocated)
+            {
+                Unity.Jobs.JobHandle build = spatialIndex.ScheduleBuild(
+                    Positions.AsReadOnly(), TotalBirdCount, default);
+                build.Complete();
+                spatial = spatialIndex.AsReadOnly();
+            }
+
+            // 2. Compute accelerations using the spatial grid for the neighbour scan.
+            //    (Slice 4 will replace this with a [BurstCompile] IJobParallelFor that
+            //    consumes the same SpatialIndexReadOnly view.)
             NaiveSteering.ComputeAccelerations(
                 Positions, Velocities, FlockIds, Slices, TotalBirdCount,
                 settingsByFlockId, this,
                 CursorWorldPoint, CursorOnScreen,
+                spatial,
                 Accelerations);
 
-            // 2. Integrate.
+            // 3. Integrate.
             NaiveSteering.Integrate(
                 Positions, Velocities, FlockIds, Accelerations, TotalBirdCount,
                 settingsByFlockId, dt);
 
-            // 3. Build world matrices (translation + look-along-velocity).
+            // 4. Build world matrices (translation + look-along-velocity).
             BuildMatrices();
 
-            // 4. Dispatch per-flock rendering.
+            // 5. Dispatch per-flock rendering.
             DispatchRendering();
         }
 

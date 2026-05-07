@@ -1,6 +1,9 @@
-// NaiveSteering.cs — main-thread O(n²) steering used by Slice 2's FlockWorld.Tick.
-// Slice 4 (M3) replaces this with [BurstCompile] IJobParallelFor variants that consume
-// the spatial grid; the per-bird math stays the same, only the dispatch changes.
+// NaiveSteering.cs — main-thread (Burst-free) steering helper consumed by FlockWorld.Tick.
+// Slice 3 (M2) rewires this from O(n²) self-iteration to neighbour-iteration via the
+// cell-list spatial grid (SpatialIndexReadOnly.GetNeighbors). The per-bird math is
+// unchanged so flocking visuals are identical to Slice 2.
+// Slice 4 (M3) replaces these helpers with [BurstCompile] IJobParallelFor variants that
+// consume the same SpatialIndexReadOnly view.
 //
 // Internal to the Simulation asmdef.
 
@@ -11,11 +14,13 @@ using Unity.Mathematics;
 namespace Bird_behiviour.Flocking.Simulation
 {
     /// <summary>
-    /// Pure-static, main-thread, naïve O(n²) implementation of every steering force used
-    /// in Slice 2: separation / alignment / cohesion (with in-flock vs out-of-flock
-    /// weights), world hard bounds, per-flock soft preferred zone, and a no-op cursor
-    /// stub. <b>NOT</b> Burst-compiled — Slice 4 (M3) jobifies + Burst-compiles the same
-    /// math into <c>NeighborForcesJob</c> / <c>BoundsForcesJob</c> / <c>CursorForceJob</c>.
+    /// Pure-static, main-thread, Burst-free implementation of every steering force:
+    /// separation / alignment / cohesion (with in-flock vs out-of-flock weights), world
+    /// hard bounds, per-flock soft preferred zone, and a no-op cursor stub. The
+    /// neighbour scan is driven by the cell-list spatial grid via
+    /// <see cref="SpatialIndexReadOnly.GetNeighbors(float3)"/>; Slice 4 (M3) jobifies +
+    /// Burst-compiles the same math into <c>NeighborForcesJob</c> /
+    /// <c>BoundsForcesJob</c> / <c>CursorForceJob</c>.
     /// </summary>
     /// <remarks>
     /// All math uses <see cref="Unity.Mathematics"/> types so the Slice-4 port is mechanical.
@@ -32,8 +37,10 @@ namespace Bird_behiviour.Flocking.Simulation
         /// <paramref name="accelerations"/>.
         /// </summary>
         /// <remarks>
-        /// O(n²) over <paramref name="count"/>. Used in Slice 2 only; Slice 4 replaces
-        /// this with a chain of jobs that share neighbour iteration via the spatial grid.
+        /// Neighbour iteration is driven by <paramref name="spatial"/>'s 27-cell scan, so
+        /// the cost is O(n · avg_cell_occupancy) rather than O(n²). Slice 4 (M3) replaces
+        /// this main-thread loop with a Burst <c>IJobParallelFor</c> consuming the same
+        /// <see cref="SpatialIndexReadOnly"/> view.
         /// </remarks>
         internal static void ComputeAccelerations(
             NativeArray<float3> positions,
@@ -45,8 +52,12 @@ namespace Bird_behiviour.Flocking.Simulation
             IFlockWorldSettings worldSettings,
             float3 cursorWorldPoint,
             bool cursorOnScreen,
+            SpatialIndexReadOnly spatial,
             NativeArray<float3> accelerations)
         {
+            // If the spatial index is empty (e.g. zero birds, or grid not allocated yet),
+            // the neighbour iterator simply yields nothing and each bird falls back to
+            // bounds + cursor. No need to special-case here.
             for (int i = 0; i < count; i++)
             {
                 byte fid = flockIds[i];
@@ -55,7 +66,11 @@ namespace Bird_behiviour.Flocking.Simulation
                 float3 pos = positions[i];
                 float3 vel = velocities[i];
 
-                float3 aNeighbor = ComputeNeighborForces(i, pos, vel, fid, positions, velocities, flockIds, count, s, settingsByFlockId);
+                float3 aNeighbor = ComputeNeighborForces(
+                    i, pos, vel, fid,
+                    positions, velocities, flockIds,
+                    spatial,
+                    s, settingsByFlockId);
                 float3 aBounds   = ComputeBoundsForces(pos, s, worldSettings);
                 float3 aCursor   = ComputeCursorForce(pos, s, cursorWorldPoint, cursorOnScreen);
 
@@ -128,7 +143,7 @@ namespace Bird_behiviour.Flocking.Simulation
             NativeArray<float3> positions,
             NativeArray<float3> velocities,
             NativeArray<byte> flockIds,
-            int count,
+            SpatialIndexReadOnly spatial,
             IFlockSettings selfSettings,
             IFlockSettings[] settingsByFlockId)
         {
@@ -153,8 +168,13 @@ namespace Bird_behiviour.Flocking.Simulation
             float3 cohAccumOut   = float3.zero;
             int countOut = 0;
 
-            for (int j = 0; j < count; j++)
+            // Iterate the 27-cell spatial neighbourhood instead of every bird in the world.
+            // Identical math per neighbour pair as the Slice 2 O(n²) loop — only the source
+            // of the candidate set changes.
+            NeighborEnumerator e = spatial.GetNeighbors(selfPos);
+            while (e.MoveNext())
             {
+                int j = e.Current;
                 if (j == self)
                 {
                     continue;
