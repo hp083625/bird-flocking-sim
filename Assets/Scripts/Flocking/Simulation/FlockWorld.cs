@@ -425,6 +425,8 @@ namespace Bird_behiviour.Flocking.Simulation
                 WorldBoundsExtents = WorldBoundsExtents,
                 WorldBoundsWeight  = WorldBoundsWeight,
                 WorldBoundsMargin  = worldMargin,
+                CursorWorldPoint   = CursorWorldPoint,
+                CursorOnScreen     = CursorOnScreen,
                 BirdCount          = TotalBirdCount,
                 BatchSize          = SteeringBatchSize,
                 Dt                 = dt,
