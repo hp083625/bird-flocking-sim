@@ -51,6 +51,20 @@ namespace Bird_behiviour.Flocking.Compute
         public Vector3 preferredCenter;
         public Vector3 preferredExtents;
         public float preferredAttractionWeight;
+
+        // ── K-series kill mechanic (K0 foundation) ──────────────────────────────
+        [Tooltip("If true, birds in this flock can be killed by predators.")]
+        public bool killable;
+        [Tooltip("If true, birds in this flock kill killable other-flock birds inside killRadius.")]
+        public bool isPredator;
+        [Tooltip("Distance (world units) within which this predator triggers a kill on a killable bird.")]
+        [Min(0f)] public float killRadius;
+        [Tooltip("Seconds before a killed bird respawns. 0 = vanish forever.")]
+        [Min(0f)] public float respawnDelaySeconds;
+        [Tooltip("Seconds the death tilt + fall animation plays before despawn.")]
+        [Min(0f)] public float deathDurationSeconds;
+        [Tooltip("Seconds after a kill the predator's chase force is suppressed (sated state).")]
+        [Min(0f)] public float satedDurationSeconds;
     }
 
     /// <summary>
@@ -132,9 +146,16 @@ namespace Bird_behiviour.Flocking.Compute
         private GraphicsBuffer cellKeysBuffer;       // RWStructuredBuffer<uint2> — 8 B / element, padded to next-pow-2 for bitonic
         private GraphicsBuffer cellStartBuffer;      // RWStructuredBuffer<uint>  — 4 B / element, sized to gridDim.x*y*z
         private GraphicsBuffer matricesBuffer;       // RWStructuredBuffer<float4x4> — 64 B / element (consumed by renderer)
-        private GraphicsBuffer flockSettingsBuffer;  // StructuredBuffer<FlockKernelSettings> — 96 B / element, sized to flock count
+        private GraphicsBuffer flockSettingsBuffer;  // StructuredBuffer<FlockKernelSettings> — 128 B / element, sized to flock count
         private GraphicsBuffer instanceFlockIdsBuffer; // StructuredBuffer<uint> — 4 B / bird, written once at init for shader tinting
+        private GraphicsBuffer killCounterBuffer;    // K3: RWStructuredBuffer<uint>, 1 element. InterlockedAdd from shader.
         private GraphicsBuffer argsBuffer;           // 1 IndirectDrawIndexedArgs
+
+        // K3: total kills since OnEnable. Updated via async readback every N frames so
+        // the FlockHUD can display it without per-frame stalls.
+        private uint cachedKillCount;
+        private int killReadbackCountdown; // ticks remaining until the next readback request
+        private bool killReadbackInFlight;
 
         // Cached grid sizing — computed in OnEnable from world bounds + perception radius.
         private int paddedKeyCount;
@@ -183,6 +204,9 @@ namespace Bird_behiviour.Flocking.Compute
         private static readonly int IdWBoundsMargin = Shader.PropertyToID("_WorldBoundsMargin");
         private static readonly int IdCursorPoint   = Shader.PropertyToID("_CursorWorldPoint");
         private static readonly int IdCursorOnScr   = Shader.PropertyToID("_CursorOnScreen");
+        private static readonly int IdNowSeconds    = Shader.PropertyToID("_NowSeconds");
+        private static readonly int IdKillCounter   = Shader.PropertyToID("_KillCounter");
+        private static readonly int IdFloorY        = Shader.PropertyToID("_FloorY");
         // Material-side (shader read).
         private static readonly int IdInstanceFlockIds = Shader.PropertyToID("_InstanceFlockIds");
         private static readonly int IdFlockColors      = Shader.PropertyToID("_FlockColors");
@@ -209,6 +233,9 @@ namespace Bird_behiviour.Flocking.Compute
 
         /// <summary>Live total bird count (sum of all configured flocks).</summary>
         public int BirdCount => resolvedTotalBirdCount > 0 ? resolvedTotalBirdCount : birdCount;
+
+        /// <summary>K3: cumulative predator kill count since OnEnable. Updated lazily via async readback (~every 30 frames).</summary>
+        public uint KillCount => cachedKillCount;
 
         // ── Lifecycle ───────────────────────────────────────────────────────────
         private void OnEnable()
@@ -294,6 +321,7 @@ namespace Bird_behiviour.Flocking.Compute
             if (matricesBuffer != null)         { matricesBuffer.Dispose();         matricesBuffer         = null; }
             if (flockSettingsBuffer != null)    { flockSettingsBuffer.Dispose();    flockSettingsBuffer    = null; }
             if (instanceFlockIdsBuffer != null) { instanceFlockIdsBuffer.Dispose(); instanceFlockIdsBuffer = null; }
+            if (killCounterBuffer != null)      { killCounterBuffer.Dispose();      killCounterBuffer      = null; }
             if (argsBuffer != null)             { argsBuffer.Dispose();             argsBuffer             = null; }
         }
 
@@ -312,6 +340,13 @@ namespace Bird_behiviour.Flocking.Compute
             paddedKeyCount = NextPowerOfTwo(total);
 
             boidsBuffer            = new GraphicsBuffer(GraphicsBuffer.Target.Structured, total, BoidGpu.Stride);
+            // K3: 1-element atomic counter — InterlockedAdd target. Initialised to 0
+            // here; reset on Restart Sim. Stride = 4 (single uint).
+            killCounterBuffer      = new GraphicsBuffer(GraphicsBuffer.Target.Structured, 1, sizeof(uint));
+            killCounterBuffer.SetData(new uint[] { 0u });
+            cachedKillCount = 0u;
+            killReadbackCountdown = 0;
+            killReadbackInFlight = false;
             cellKeysBuffer         = new GraphicsBuffer(GraphicsBuffer.Target.Structured, paddedKeyCount, sizeof(uint) * 2);
             cellStartBuffer        = new GraphicsBuffer(GraphicsBuffer.Target.Structured, cellTotalCount, sizeof(uint));
             matricesBuffer         = new GraphicsBuffer(GraphicsBuffer.Target.Structured, total, sizeof(float) * 16);
@@ -519,6 +554,14 @@ namespace Bird_behiviour.Flocking.Compute
                         PreferredCenter           = (float3)c.preferredCenter,
                         PreferredAttractionWeight = c.preferredAttractionWeight,
                         PreferredExtents          = (float3)c.preferredExtents,
+                        Killable                  = c.killable    ? 1f : 0f,
+                        IsPredator                = c.isPredator  ? 1f : 0f,
+                        KillRadius                = c.killRadius,
+                        RespawnDelaySeconds       = c.respawnDelaySeconds,
+                        DeathDurationSeconds      = c.deathDurationSeconds,
+                        SatedDurationSeconds      = c.satedDurationSeconds,
+                        Pad0                      = 0f,
+                        Pad1                      = 0f,
                     };
                 }
                 flockSettingsBuffer.SetData(arr);
@@ -611,15 +654,20 @@ namespace Bird_behiviour.Flocking.Compute
             steeringShader.SetBuffer(kSteerCellList, IdCellStart,     cellStartBuffer);
 
             // P3: topo-K kernel reads the per-flock settings buffer.
+            // K3: also writes to the kill counter atomically.
             steeringShader.SetBuffer(kSteerTopoK, IdBoids,         boidsBuffer);
             steeringShader.SetBuffer(kSteerTopoK, IdCellKeys,      cellKeysBuffer);
             steeringShader.SetBuffer(kSteerTopoK, IdCellStart,     cellStartBuffer);
             steeringShader.SetBuffer(kSteerTopoK, IdFlockSettings, flockSettingsBuffer);
+            steeringShader.SetBuffer(kSteerTopoK, IdKillCounter,   killCounterBuffer);
 
             steeringShader.SetBuffer(kSteerBruteForce, IdBoids, boidsBuffer);
 
-            steeringShader.SetBuffer(kBuildMat, IdBoids,    boidsBuffer);
-            steeringShader.SetBuffer(kBuildMat, IdMatrices, matricesBuffer);
+            steeringShader.SetBuffer(kBuildMat, IdBoids,         boidsBuffer);
+            steeringShader.SetBuffer(kBuildMat, IdMatrices,      matricesBuffer);
+            // K2 build-matrices reads FlockSettings to know the death-anim duration
+            // per flock. Bind the same buffer here.
+            steeringShader.SetBuffer(kBuildMat, IdFlockSettings, flockSettingsBuffer);
         }
 
         // ── Per-frame ───────────────────────────────────────────────────────────
@@ -681,6 +729,14 @@ namespace Bird_behiviour.Flocking.Compute
             steeringShader.SetVector(IdCursorPoint, new Vector4(cursorWP.x, cursorWP.y, cursorWP.z, 0f));
             steeringShader.SetInt   (IdCursorOnScr, onScreen ? 1 : 0);
 
+            // K0/K2 wall-clock + floor-Y for kill-mechanic timing.
+            steeringShader.SetFloat(IdNowSeconds, Time.time);
+            steeringShader.SetFloat(IdFloorY,     worldBoundsCenter.y - worldBoundsExtents.y);
+
+            // K3 async kill-count readback. Request every ~30 frames; the latest
+            // completed value is what FlockHUD reads via the public KillCount.
+            TickKillReadback();
+
             // ── Dispatch ────────────────────────────────────────────────────────
             int groupsBird = (total + 63) / 64;
             int groupsKey  = (paddedKeyCount + 63) / 64;
@@ -719,6 +775,33 @@ namespace Bird_behiviour.Flocking.Compute
                         default, total, Camera.main);
                 }
             }
+        }
+
+        // K3: schedules an async readback of the kill counter every ~30 ticks. The
+        // readback callback writes cachedKillCount when complete. We never block the
+        // main thread on the GPU — the HUD shows the most-recently-completed value,
+        // which lags reality by at most a few frames (imperceptible).
+        //
+        // killReadbackInFlight prevents queueing multiple concurrent readbacks if
+        // the GPU is slow to respond (rare on Apple Silicon's unified memory but
+        // matters on Windows/PC where readback latency can spike).
+        private void TickKillReadback()
+        {
+            if (killCounterBuffer == null) return;
+            killReadbackCountdown--;
+            if (killReadbackCountdown > 0 || killReadbackInFlight) return;
+            killReadbackCountdown = 30;
+            killReadbackInFlight = true;
+            UnityEngine.Rendering.AsyncGPUReadback.Request(killCounterBuffer, OnKillReadback);
+        }
+
+        private void OnKillReadback(UnityEngine.Rendering.AsyncGPUReadbackRequest req)
+        {
+            killReadbackInFlight = false;
+            if (req.hasError || !req.done) return;
+            // Buffer is single uint — first 4 bytes of the readback contain the count.
+            var data = req.GetData<uint>();
+            if (data.Length > 0) cachedKillCount = data[0];
         }
 
         // Project the system mouse pointer onto the horizontal plane at y=cursorPlaneY.

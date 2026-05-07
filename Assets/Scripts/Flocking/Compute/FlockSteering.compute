@@ -40,7 +40,7 @@ struct Boid
 };
 
 // ── FlockKernelSettings struct (mirror of Compute/FlockSettingsGpu.cs) ────────
-// 96 bytes, 16-byte aligned. Indexed by Boid.flockId.
+// 128 bytes (post-K0), 16-byte aligned. Indexed by Boid.flockId.
 struct FlockKernelSettings
 {
     float3 color;                       float perceptionRadius;
@@ -52,6 +52,9 @@ struct FlockKernelSettings
     float  cursorReactionStrength;
     float  cursorReactionRadius;        float3 preferredCenter;
     float  preferredAttractionWeight;   float3 preferredExtents;
+    // K0 kill-mechanic foundation:
+    float  killable;                    float isPredator;        float killRadius;       float respawnDelaySeconds;
+    float  deathDurationSeconds;        float satedDurationSeconds; float _pad0;          float _pad1;
 };
 
 // ── Buffers ────────────────────────────────────────────────────────────────────
@@ -106,6 +109,13 @@ float  _WorldBoundsMargin;
 // the cursor was successfully projected onto the horizontal plane this tick.
 float3 _CursorWorldPoint;
 uint   _CursorOnScreen; // 0 or 1; bool-like for SetInt
+
+// K0 wall-clock seconds — used to timestamp deaths and check respawn/sated timers.
+float _NowSeconds;
+// K3 atomic kill counter (single-element RWStructuredBuffer<uint>). InterlockedAdd-able.
+RWStructuredBuffer<uint> _KillCounter;
+// K2 floor Y (= worldBoundsCenter.y - worldBoundsExtents.y). Death-fall clamps here.
+float _FloorY;
 
 // P5 split-K-NN sizes — file-scope #defines because HLSL → Metal can't always
 // accept a function-scope `const uint` as a stack-array size; the size must
@@ -500,6 +510,51 @@ void CSSteerTopoK(uint3 tid : SV_DispatchThreadID)
     uint   selfFlock = me.flockId;
     FlockKernelSettings s = _FlockSettings[selfFlock];
 
+    // ── K1/K2/K3: Death-state branch ──────────────────────────────────────────
+    // Reserved.x  = 1 → dead
+    // Reserved.y  = death timestamp
+    // Reserved.z  = current fall vertical velocity (reset to 0 at death)
+    // Once dead, skip the K-NN walk + force computation entirely. Update fall
+    // physics, check respawn timer, write back. Still pays a memory R/W per dead
+    // bird but skips the expensive 27-cell + insertion-sort cost.
+    bool dead = (me.reserved.x > 0.5f);
+    if (dead)
+    {
+        float deathAge = _NowSeconds - me.reserved.y;
+        // K3 respawn — if respawnDelaySeconds > 0 AND deathAge passed, reset.
+        if (s.respawnDelaySeconds > 0.0f && deathAge >= s.respawnDelaySeconds)
+        {
+            // Tiny per-bird PRNG (Wang hash variant) seeded from boidId + frame.
+            uint seed = i * 0x9E3779B9u ^ asuint(_NowSeconds) * 0x85EBCA6Bu;
+            seed = (seed ^ (seed >> 16u)) * 0x21F0AAADu;
+            seed = (seed ^ (seed >> 15u)) * 0x735A2D97u;
+            seed = seed ^ (seed >> 15u);
+            float rx = ((seed       ) & 0xFFFFu) / 65535.0f * 2.0f - 1.0f;
+            float ry = ((seed >> 16u) & 0xFFFFu) / 65535.0f * 2.0f - 1.0f;
+            seed = seed * 0x9E3779B9u + 1u;
+            float rz = ((seed       ) & 0xFFFFu) / 65535.0f * 2.0f - 1.0f;
+            float vy = ((seed >> 16u) & 0xFFFFu) / 65535.0f * 2.0f - 1.0f;
+            me.pos = s.preferredCenter + float3(rx, ry, rz) * s.preferredExtents;
+            float3 dir = normalize(float3(rx + 0.001f, vy, rz + 0.001f));
+            me.vel = dir * s.minSpeed;
+            me.reserved = float4(0, 0, 0, 0); // alive again, sated cleared
+            _Boids[i] = me;
+            return;
+        }
+        // K2 fall animation — gravity until floor; float wings spread (caller's
+        // CSBuildMatrices renders the tilted matrix).
+        me.reserved.z -= 9.81f * _Dt;
+        float3 fallVel = float3(0, me.reserved.z, 0);
+        me.pos += fallVel * _Dt;
+        if (me.pos.y < _FloorY)
+        {
+            me.pos.y = _FloorY;
+            me.reserved.z = 0; // settled
+        }
+        _Boids[i] = me;
+        return;
+    }
+
     int3 myCell = WorldToCell(selfPos);
     float perceptSq = s.perceptionRadius * s.perceptionRadius;
 
@@ -626,11 +681,39 @@ void CSSteerTopoK(uint3 tid : SV_DispatchThreadID)
         countIn++;
     }
 
+    // K1/K3/K4: walk out-of-flock K-NN. While accumulating forces we also check
+    // the kill conditions:
+    //   - if I'M killable AND any out-of-flock neighbour is a predator within
+    //     ITS killRadius → mark me dead (Reserved.x = 1) + atomic increment kill counter.
+    //   - if I'M a predator AND any out-of-flock neighbour is killable within
+    //     MY killRadius → set my sated timer (Reserved.w).
+    bool diedThisTick = false;
     [unroll] for (uint ko = 0; ko < K_OUT; ++ko)
     {
         if (outIds[ko] == 0xFFFFFFFFu) break;
-        Boid nb = _Boids[outIds[ko]];
+        uint nbId = outIds[ko];
+        Boid nb = _Boids[nbId];
+        FlockKernelSettings nbS = _FlockSettings[nb.flockId];
         float distSq = outSq[ko];
+
+        // K1 kill detection (prey side). Use the PREDATOR's killRadius — the
+        // attacker defines the dangerous zone.
+        if (s.killable > 0.5f && nbS.isPredator > 0.5f && nbS.killRadius > 0.0f)
+        {
+            if (distSq < nbS.killRadius * nbS.killRadius)
+            {
+                diedThisTick = true;
+            }
+        }
+        // K4 sated-on-kill (predator side).
+        if (s.isPredator > 0.5f && nbS.killable > 0.5f && s.killRadius > 0.0f)
+        {
+            if (distSq < s.killRadius * s.killRadius)
+            {
+                me.reserved.w = _NowSeconds + s.satedDurationSeconds;
+            }
+        }
+
         if (distSq < sepRSq)
         {
             float3 toN = nb.pos - selfPos;
@@ -642,6 +725,21 @@ void CSSteerTopoK(uint3 tid : SV_DispatchThreadID)
         aliOutS += nb.vel;
         cohOutS += nb.pos;
         countOut++;
+    }
+
+    // K1 commit-kill: if any predator was inside its killRadius this tick, this
+    // bird dies. We commit the death state right before integration; the next
+    // tick will see Reserved.x=1 and take the dead branch (skip steering, fall).
+    if (diedThisTick)
+    {
+        me.reserved.x = 1.0f;
+        me.reserved.y = _NowSeconds;
+        me.reserved.z = 0.0f;
+        // K3 score — single global counter, atomic increment so concurrent kills
+        // by different threads compose without races.
+        InterlockedAdd(_KillCounter[0], 1u);
+        _Boids[i] = me;
+        return;
     }
 
     // Reynolds alignment + cohesion folded through the in/out branch.
@@ -664,8 +762,13 @@ void CSSteerTopoK(uint3 tid : SV_DispatchThreadID)
         float aSqv = dot(avgVel, avgVel);
         float3 aliOut = (aSqv > 1e-12f) ? ((avgVel * rsqrt(aSqv) * s.maxSpeed) - selfVel) : float3(0, 0, 0);
         float3 cohOut = (cohOutS * invN) - selfPos;
+        // K4 sated suppression — predator's outCohesion (= chase pull) drops to 0
+        // while the sated timer is active. Other out-of-flock weights are
+        // unaffected; for a non-predator s.satedDurationSeconds is 0 so this is
+        // a no-op (Reserved.w stays at init zero, sated factor = 1).
+        float satedFactor = (_NowSeconds < me.reserved.w) ? 0.0f : 1.0f;
         ali += aliOut * s.outAliW;
-        coh += cohOut * s.outCohW;
+        coh += cohOut * s.outCohW * satedFactor;
     }
     float3 sep = sepIn * s.inSepW + sepOut * s.outSepW;
 
@@ -773,6 +876,37 @@ void CSBuildMatrices(uint3 tid : SV_DispatchThreadID)
     if (i >= _BirdCount) return;
 
     Boid b = _Boids[i];
+
+    // K1/K2 dead-bird path. After deathDurationSeconds, write a zero matrix so
+    // the vertex shader collapses every vertex to the origin (mesh becomes a
+    // single invisible point). During the death window, render the bird tilted
+    // nose-down at its falling position so the kill is visible.
+    if (b.reserved.x > 0.5f)
+    {
+        FlockKernelSettings s = _FlockSettings[b.flockId];
+        float deathAge = _NowSeconds - b.reserved.y;
+        // Despawn-vanish window: respawn timer hasn't fired yet AND the death
+        // anim window has expired → invisible until respawn.
+        if (deathAge > s.deathDurationSeconds && s.respawnDelaySeconds > s.deathDurationSeconds)
+        {
+            _Matrices[i] = (float4x4)0;
+            return;
+        }
+        // Death tilt: bird's fwd tipped toward world-down. Same right axis as
+        // its last living frame would have used (cross with worldUp), but pitch
+        // increases linearly with deathAge.
+        float pitch = saturate(deathAge / max(s.deathDurationSeconds, 0.001f)) * 1.5f; // up to ~85°
+        float3 fwd  = float3(0, -sin(pitch), cos(pitch));
+        float3 right = float3(1, 0, 0);
+        float3 up = cross(fwd, right);
+        _Matrices[i] = float4x4(
+            right.x, up.x, fwd.x, b.pos.x,
+            right.y, up.y, fwd.y, b.pos.y,
+            right.z, up.z, fwd.z, b.pos.z,
+            0,       0,    0,     1);
+        return;
+    }
+
     float3 fwd = b.vel;
     float speedSq = dot(fwd, fwd);
     if (speedSq < 1e-6f)
