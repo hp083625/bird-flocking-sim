@@ -27,7 +27,7 @@ MonoBehaviour:
   minSpeed: 1
   maxSpeed: 10
   maxAcceleration: 30
-  cursorReactionStrength: 0
+  cursorReactionStrength: -3
   cursorReactionRadius: 10
   birdCount: 100
   birdMesh: {fileID: 4300000, guid: 750a2c182d36147379c2568ef21c867c, type: 2}
