@@ -225,11 +225,66 @@ namespace Bird_behiviour.Flocking.Simulation
             arraysAllocated = false;
         }
 
+        /// <summary>
+        /// Tears down all per-bird native arrays + any spatial index, then re-registers every
+        /// currently-bound <see cref="FlockManager"/> from scratch. Used by Slice 10's
+        /// "Apply Structural Changes" / "Restart Sim" buttons after a structural change
+        /// (BirdCount, PerceptionRadius, world bounds) has been committed.
+        /// </summary>
+        /// <remarks>
+        /// Safe to call from EditMode (when <see cref="Tick"/> isn't running) and from PlayMode.
+        /// Implementation snapshots the registered list because each
+        /// <see cref="FlockManager.Rebuild"/> deregisters + re-registers, which mutates the
+        /// list mid-iteration. Per <c>FLOCKING_PLAN.md §6 M1-6</c>, the only managed
+        /// allocations are the realloc itself + the single snapshot array.
+        /// <para/>
+        /// The spatial index dispose path is a stub guarded by a null check — Slice 3 will
+        /// flesh it out when <c>FlockWorld</c> grows a <c>SpatialHashGrid</c> field.
+        /// </remarks>
+        public void Rebuild()
+        {
+            // No registered managers → just clear stale arrays so a later Register starts clean.
+            if (registered.Count == 0)
+            {
+                DisposeArrays();
+                DisposeSpatialIndex();
+                TotalBirdCount = 0;
+                settingsByFlockId = System.Array.Empty<IFlockSettings>();
+                return;
+            }
+
+            // Spatial index (if any) lives across the whole sim — tear it down so the next
+            // tick rebuilds it against the new world arrays. Slice 3 wires this in.
+            DisposeSpatialIndex();
+
+            // Snapshot — manager.Rebuild() Deregister+Register mutates `registered`.
+            FlockManager[] snapshot = registered.ToArray();
+            for (int i = 0; i < snapshot.Length; i++)
+            {
+                FlockManager mgr = snapshot[i];
+                if (mgr != null)
+                {
+                    mgr.Rebuild();
+                }
+            }
+        }
+
+        /// <summary>
+        /// Slice-3-shaped extension point: Slice 3 (M2 Spatial) will store a
+        /// <c>SpatialHashGrid</c> reference on this MonoBehaviour and dispose it here.
+        /// Slice 10 ships the no-op so <see cref="Rebuild"/> already calls a stable hook.
+        /// </summary>
+        private void DisposeSpatialIndex()
+        {
+            // Intentional no-op until Slice 3 lands the spatial index field on FlockWorld.
+        }
+
         // ── Unity lifecycle ──────────────────────────────────────────────────────────
 
         private void OnDestroy()
         {
             DisposeArrays();
+            DisposeSpatialIndex();
         }
 
         private void LateUpdate()
